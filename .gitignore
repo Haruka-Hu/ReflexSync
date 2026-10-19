@@ -42,10 +42,9 @@ hammer_[0-9]*.json
 *.pem
 *.key
 
-# Publish current usage docs; keep local history/paths/measurements private
+# Publish the current Markdown documentation; local metadata stays ignored
 /notes/*
-!/notes/电机控制与移植说明.md
-!/notes/发布检查说明.md
+!/notes/*.md
 
 # Generated figures, multimedia and metadata; keep the intentional motor config
 *.png

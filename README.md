@@ -25,7 +25,7 @@ cd ReflexSync
 pixi install --locked
 
 # 48CH EMG / IMU 采集和 MVC 反馈
-pixi run scope48-mvc
+pixi run scope48-mvc --ads-gain 6
 
 # 电机上位机：USB / BLE，手动连接
 pixi run motor-host
@@ -61,7 +61,7 @@ pixi run upload-master --port <RUNTIME_PORT> --rom-port <ROM_PORT>
 - 首次操作应确认物理零位并执行 ZERO，再从低速档验证行程。STOP 后需要重新确认并归零。
 - 新电机协议为 `HAMMER_COAST_V7 / protocol=2`，使用 `SET / START / RETRACT / FIRE / STOP / TRACE` 等命令。
 
-详细操作见 [电机控制说明](notes/电机控制与移植说明.md)。编码器速度突降是接触候选，不等同于独立力测量；目标速度、允许输入范围也不代表机械验收结果。
+详细操作见 [电机控制说明](notes/电机控制说明.md)。编码器速度突降是接触候选，不等同于独立力测量；目标速度、允许输入范围也不代表机械验收结果。
 
 ## 文件结构
 
@@ -81,6 +81,10 @@ hammer_profiles.json    电机五档配置
 platformio.ini          固件板卡配置
 pixi.toml / pixi.lock    Python / PlatformIO 环境和任务
 ```
+
+## 文档
+
+从 [文档索引](notes/文档索引.md) 开始，查看当前系统架构、接线与增益、构建烧录、采集界面、电机操作、协议和代码调用顺序。文档按当前源码重写，旧方案与历史实测已备份到仓库外。
 
 ## 数据与 GitHub 上传范围
 
