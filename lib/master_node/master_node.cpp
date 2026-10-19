@@ -1,0 +1,1139 @@
+#include "master_node.h"
+#include <esp32-hal-psram.h>
+#include <esp_log.h> // ✅ 1. 引入 ESP-IDF 日志库
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <string.h>
+
+namespace {
+
+MasterApp *g_activeApp = nullptr;
+constexpr uint32_t TASK_STACK_DEFAULT = 4096;
+constexpr uint32_t TASK_STACK_SERIAL_TX = 12288;
+constexpr uint16_t RADIO_CONFIG_APPLY_DELAY_MS = 250;
+constexpr uint8_t RADIO_CONFIG_REPEAT_COUNT = 10;
+
+wifi_phy_rate_t radioRateFromCode(uint8_t rateCode) {
+  return rateCode == capture::ESPNOW_RATE_1M ? WIFI_PHY_RATE_1M_L : WIFI_PHY_RATE_2M_L;
+}
+
+}  // namespace
+
+// 保存板级配置，并把 ADS1298 驱动绑定到 Master 的本地 EMG 引脚。
+MasterApp::MasterApp(const Config &config) : config_(config), ads_(config.adsPins) {}
+
+// 初始化串口、ADS1298、ESP-NOW 和三个后台任务。
+void MasterApp::begin() {
+  g_activeApp = this;
+  // ✅ 2. 闭嘴！禁止所有底层库（特别是 Wi-Fi）向串口乱喷 ASCII 日志
+  esp_log_level_set("*", ESP_LOG_NONE);
+
+  ads_.begin(onAdsDrdyStatic);
+  // 先只创建无线回调必需的接收队列，并完成 ESP-NOW 初始化。大数据队列放在后面，
+  // 避免 USB/EMG 缓冲先耗尽内部 SRAM，导致 ESP-NOW 静默初始化失败。
+  slaveRxQueue_ = xQueueCreate(SLAVE_RX_QUEUE_SIZE, sizeof(SlaveRxItem));
+  if (slaveRxQueue_ == nullptr) {
+    ++startupFaults_;
+  } else {
+    for (uint8_t attempt = 0; attempt < 3 && !espNowReady_; ++attempt) {
+      espNowReady_ = initEspNow();
+      if (!espNowReady_) {
+        ++startupFaults_;
+        vTaskDelay(pdMS_TO_TICKS(50));
+      }
+    }
+  }
+
+  // 重传历史放在外部 PSRAM，不能再占用 ESP-NOW 依赖的内部 DMA SRAM。
+  // 无 PSRAM 时保持 nullptr，主链路继续工作，只是不提供历史帧补发。
+  if (psramFound()) {
+    pcRetxCache_ = static_cast<PcRetxCacheEntry *>(
+        ps_calloc(PC_RETX_CACHE_SIZE, sizeof(PcRetxCacheEntry)));
+  }
+
+  // ESP-NOW 已经拿到所需内部 SRAM 后，再扩展 USB TX ring。
+#if ARDUINO_USB_MODE
+  if (Serial.setTxBufferSize(16384) == 0) {
+    ++startupFaults_;
+  }
+#endif
+  Serial.begin(config_.serialBaud);
+  Serial.setTxTimeoutMs(1000);
+  delay(300);
+
+  serialQueue_ = xQueueCreate(OLD_SERIAL_QUEUE_SIZE, sizeof(capture::PcSample));
+  emg48Queue_ = xQueueCreate(EMG48_QUEUE_SIZE, sizeof(capture::Emg48Sample));
+  imuPcQueue_ = xQueueCreate(IMU_PC_QUEUE_SIZE, sizeof(capture::ImuBatchWirePacket));
+  serialFrameQueue_ = xQueueCreate(PC_SERIAL_FRAME_QUEUE_SIZE, sizeof(PcSerialTxFrame));
+  serialWriteMux_ = xSemaphoreCreateMutex();
+  commandTxMux_ = xSemaphoreCreateMutex();
+  pcRetxMux_ = xSemaphoreCreateMutex();
+  if (serialQueue_ == nullptr || emg48Queue_ == nullptr || imuPcQueue_ == nullptr ||
+      serialFrameQueue_ == nullptr || serialWriteMux_ == nullptr || pcRetxMux_ == nullptr) {
+    ++startupFaults_;
+  }
+
+  // 串口写、无线处理、ADS 采样分开跑，避免任一路 I/O 抖动拖慢其他链路。
+  xTaskCreatePinnedToCore(wirelessTaskStatic, "masterWireless", TASK_STACK_DEFAULT, this, 7, nullptr, 0);
+  xTaskCreatePinnedToCore(serialCommandTaskStatic, "serialCommand", TASK_STACK_DEFAULT, this, 6, nullptr, 0);
+  xTaskCreatePinnedToCore(serialTxTaskStatic, "serialTx", TASK_STACK_SERIAL_TX, this, 5, nullptr, 0);
+  xTaskCreatePinnedToCore(sensorTaskStatic, "masterSensor", TASK_STACK_DEFAULT, this, 5, nullptr, 1);
+}
+
+// ADS1298 DRDY 中断的静态转发入口。
+void IRAM_ATTR MasterApp::onAdsDrdyStatic() {
+  if (g_activeApp != nullptr) {
+    g_activeApp->onAdsDrdyFromIsr();
+  }
+}
+
+// ESP-NOW 接收回调的静态转发入口。
+void MasterApp::onEspNowRecvStatic(const uint8_t *mac, const uint8_t *data, int len) {
+  if (g_activeApp != nullptr) {
+    g_activeApp->onEspNowRecv(mac, data, len);
+  }
+}
+
+// FreeRTOS 串口发送任务的静态转发入口。
+void MasterApp::serialTxTaskStatic(void *arg) {
+  static_cast<MasterApp *>(arg)->serialTxTask();
+}
+
+// FreeRTOS 无线处理任务的静态转发入口。
+void MasterApp::wirelessTaskStatic(void *arg) {
+  static_cast<MasterApp *>(arg)->wirelessTask();
+}
+
+// FreeRTOS ADS 采样任务的静态转发入口。
+void MasterApp::sensorTaskStatic(void *arg) {
+  static_cast<MasterApp *>(arg)->sensorTask();
+}
+
+void MasterApp::serialCommandTaskStatic(void *arg) {
+  static_cast<MasterApp *>(arg)->serialCommandTask();
+}
+
+// 在 ISR 中通知 sensorTask 有一帧 ADS1298 数据可读。
+void MasterApp::onAdsDrdyFromIsr() {
+  // ISR 不读 SPI，只唤醒采样任务；SPI 读写留在普通任务上下文中完成。
+  ++emgDrdyCount_;
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  if (sensorTaskHandle_ != nullptr) {
+    vTaskNotifyGiveFromISR(sensorTaskHandle_, &xHigherPriorityTaskWoken);
+  }
+  if (xHigherPriorityTaskWoken) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+// 把 ESP-NOW 收到的 IMU batch 原样拷贝进队列，留给 wirelessTask 解码。
+void MasterApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  // ESP-NOW 回调运行环境较敏感，这里只做长度检查和拷贝入队。
+  if (data == nullptr || len <= 0 || len > static_cast<int>(capture::IMU_BATCH_WIRE_SIZE)) {
+    return;
+  }
+  const uint32_t rxTimeUs = micros();
+  const uint8_t type = data[0];
+  if (type != capture::MSG_TYPE_IMU_BATCH &&
+      type != capture::MSG_TYPE_SYNC_DIAG &&
+      type != capture::MSG_TYPE_STATE_ACK &&
+      type != capture::MSG_TYPE_SYNC_PROBE) {
+    return;
+  }
+
+  SlaveRxItem item{};
+  if (mac != nullptr) {
+    memcpy(item.mac, mac, 6);
+  }
+  item.len = static_cast<uint8_t>(len);
+  item.rxTimeUs = rxTimeUs;
+  memcpy(item.bytes, data, len);
+
+  if (slaveRxQueue_ != nullptr) {
+    if (xQueueSend(slaveRxQueue_, &item, 0) != pdTRUE) {
+      ++slaveQueueDrops_;
+    }
+  }
+}
+
+// 初始化 Master 的 ESP-NOW STA 模式、固定信道和广播 peer。
+bool MasterApp::initEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.setSleep(false);
+  esp_wifi_set_channel(currentChannel_, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    return false;
+  }
+
+  // ✅ 新增：强制将 ESP-NOW 物理层空口速率从默认的 1Mbps 提升到 2Mbps
+  // 大幅减少数据包在空气中的发送耗时，降低被干扰的概率
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, radioRateFromCode(currentRateCode_));
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastMac_, sizeof(broadcastMac_));
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    esp_now_deinit();
+    return false;
+  }
+
+  if (esp_now_register_recv_cb(onEspNowRecvStatic) != ESP_OK) {
+    esp_now_deinit();
+    return false;
+  }
+  return true;
+}
+
+// 确保某个 Slave MAC 已登记为 ESP-NOW peer，ACK 单播前会调用。
+bool MasterApp::ensureEspNowPeer(const uint8_t mac[6]) {
+  if (mac == nullptr) {
+    return false;
+  }
+  if (esp_now_is_peer_exist(mac)) {
+    return true;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+  return esp_now_add_peer(&peerInfo) == ESP_OK;
+}
+
+// 更新 Slave 在线诊断信息，包括最近接收时间和样本累计数。
+void MasterApp::trackSlave(const uint8_t mac[6], uint8_t source, uint32_t nowUs, uint32_t sampleCount) {
+  // 在线统计按 MAC 记录，和 ACK 窗口分开，避免诊断逻辑影响可靠传输。
+  if (mac == nullptr) {
+    return;
+  }
+
+  int freeIndex = -1;
+  int oldestIndex = -1;
+  uint32_t oldestSeen = 0;
+
+  for (size_t i = 0; i < MAX_TRACKED_SLAVES; ++i) {
+    if (slaveTrackers_[i].used) {
+      if (capture::macEquals(slaveTrackers_[i].mac, mac)) {
+        slaveTrackers_[i].source = source;
+        slaveTrackers_[i].lastSeenUs = nowUs;
+        slaveTrackers_[i].totalSamples += sampleCount;
+        return;
+      }
+      if (oldestIndex < 0 || static_cast<int32_t>(slaveTrackers_[i].lastSeenUs - oldestSeen) < 0) {
+        oldestIndex = static_cast<int>(i);
+        oldestSeen = slaveTrackers_[i].lastSeenUs;
+      }
+    } else if (freeIndex < 0) {
+      freeIndex = static_cast<int>(i);
+    }
+  }
+
+  int target = freeIndex;
+  if (target < 0) {
+    target = oldestIndex;
+    ++slaveRegistryDrops_;
+  }
+  if (target < 0) {
+    return;
+  }
+
+  slaveTrackers_[target].used = true;
+  memcpy(slaveTrackers_[target].mac, mac, 6);
+  slaveTrackers_[target].source = source;
+  slaveTrackers_[target].lastSeenUs = nowUs;
+  slaveTrackers_[target].totalSamples = sampleCount;
+}
+
+// 统计最近一段时间内仍在发送数据的 Slave 数量。
+int32_t MasterApp::countOnlineSlaves(uint32_t nowUs) {
+  int32_t online = 0;
+  for (size_t i = 0; i < MAX_TRACKED_SLAVES; ++i) {
+    if (!slaveTrackers_[i].used) {
+      continue;
+    }
+    const uint32_t silenceUs = static_cast<uint32_t>(nowUs - slaveTrackers_[i].lastSeenUs);
+    if (silenceUs <= SLAVE_OFFLINE_TIMEOUT_US) {
+      ++online;
+    }
+  }
+  return online;
+}
+
+// 获取或创建某个 Slave 的可靠接收窗口状态。
+MasterApp::SlaveRxState *MasterApp::getSlaveRxState(const uint8_t mac[6], uint8_t source) {
+  if (mac == nullptr) {
+    return nullptr;
+  }
+
+  int freeIndex = -1;
+  for (size_t i = 0; i < MAX_TRACKED_SLAVES; ++i) {
+    if (slaveRxStates_[i].used) {
+      if (capture::macEquals(slaveRxStates_[i].mac, mac) && slaveRxStates_[i].source == source) {
+        return &slaveRxStates_[i];
+      }
+    } else if (freeIndex < 0) {
+      freeIndex = static_cast<int>(i);
+    }
+  }
+
+  if (freeIndex < 0) {
+    ++slaveRegistryDrops_;
+    return nullptr;
+  }
+
+  SlaveRxState &state = slaveRxStates_[freeIndex];
+  state = {};
+  state.used = true;
+  state.source = source;
+  memcpy(state.mac, mac, 6);
+  return &state;
+}
+
+// 根据 recvBitmap 推进连续 ACK 基准。
+void MasterApp::advanceAckWindow(SlaveRxState &state) {
+  // 只要 bitmap 的最低位连续为 1，就可以推进连续 ACK 基准。
+  while ((state.recvBitmap & 0x01U) != 0) {
+    ++state.ackBaseSeq;
+    state.ackSampleSeq += capture::IMU_BATCH_SIZE;
+    state.recvBitmap >>= 1;
+  }
+}
+
+// 将一个已通过 CRC 的 batch 写入接收窗口，并判断它是否为重复包。
+void MasterApp::markBatchReceived(SlaveRxState &state,
+                                  uint16_t batchSeq,
+                                  uint32_t sampleStartSeq,
+                                  uint8_t flags,
+                                  bool &outDuplicate) {
+  outDuplicate = false;
+  const bool isRetransmit = (flags & capture::IMU_FLAG_RETRANSMIT) != 0;
+
+  if (!state.initialized) {
+    // 第一个包作为接收窗口锚点，使后续 ACK 可以表达“这个包和它之后 32 个包”的状态。
+    state.initialized = true;
+    state.ackBaseSeq = static_cast<uint16_t>(batchSeq - 1U);
+    state.ackSampleSeq = sampleStartSeq - capture::IMU_BATCH_SIZE;
+    state.recvBitmap = 0;
+  }
+
+  uint16_t distance = static_cast<uint16_t>(batchSeq - state.ackBaseSeq);
+  if (distance == 0 || distance > 32768U) {
+    outDuplicate = true;
+    ++state.duplicatePackets;
+    if (!isRetransmit) {
+      ++slaveDuplicatePackets_;
+    }
+    return;
+  }
+
+  if (distance > 32U) {
+    // 跳出 32 位窗口说明中间缺口已经无法用当前 ACK 表达，显式记为 missing。
+    const uint32_t skipped = static_cast<uint32_t>(distance - 1U);
+    state.missingPackets += skipped;
+    slaveMissingPackets_ += skipped;
+    state.ackBaseSeq = static_cast<uint16_t>(batchSeq - 1U);
+    state.ackSampleSeq = sampleStartSeq - capture::IMU_BATCH_SIZE;
+    state.recvBitmap = 0;
+    distance = 1;
+  }
+
+  const uint32_t mask = 1UL << (distance - 1U);
+  if ((state.recvBitmap & mask) != 0) {
+    outDuplicate = true;
+    ++state.duplicatePackets;
+    if (!isRetransmit) {
+      ++slaveDuplicatePackets_;
+    }
+    return;
+  }
+
+  state.recvBitmap |= mask;
+  if (isRetransmit) {
+    ++state.retransmitPackets;
+    ++slaveRetransmitPackets_;
+  }
+  advanceAckWindow(state);
+}
+
+// 按当前接收窗口状态构造 ACK 并单播回 Slave。
+bool MasterApp::sendAck(SlaveRxState &state, uint32_t nowUs) {
+  // ACK 单播回原 MAC；如果 peer 未登记，先补登记再发送。
+  state.lastAckSentUs = nowUs;
+  // ✅ 修复关键：无论底层 Wi-Fi 发送是否成功，先清除 pending 标志。
+  // 把重传的责任交还给 Slave 的超时机制，防止 Master TX 队列死锁。
+  state.ackPending = false;
+  if (!ensureEspNowPeer(state.mac)) {
+    ++ackSendFails_;
+    return false;
+  }
+
+  uint8_t ack[capture::IMU_ACK_WIRE_SIZE] = {};
+  capture::buildAckPacket(state.source, state.ackBaseSeq, state.ackSampleSeq, state.recvBitmap, nowUs, ack);
+  if (esp_now_send(state.mac, ack, sizeof(ack)) != ESP_OK) {
+    ++ackSendFails_;
+    return false;
+  }
+  state.ackPending = false;
+  return true;
+}
+
+// 把同一 Slave 短时间内产生的多个 ACK 合并成一次；8ms 足够避开 ACK 风暴，
+// 同时能在 Slave 进入重传周期前确认 20ms 一个的新 batch。
+void MasterApp::sendPendingAcks(uint32_t nowUs) {
+  for (size_t i = 0; i < MAX_TRACKED_SLAVES; ++i) {
+    SlaveRxState &state = slaveRxStates_[i];
+    if (!state.used || !state.ackPending) {
+      continue;
+    }
+    if (state.lastAckSentUs != 0 &&
+        static_cast<uint32_t>(nowUs - state.lastAckSentUs) < ACK_MIN_INTERVAL_US) {
+      continue;
+    }
+    sendAck(state, nowUs);
+  }
+}
+
+// 将一条 EMG/IMU/Diag 样本写入串口发送队列。
+void MasterApp::writeSerialSample(uint8_t source,
+                                  uint32_t timestampUs,
+                                  uint32_t sampleSeq,
+                                  uint16_t batchSeq,
+                                  uint8_t flags,
+                                  int32_t x,
+                                  int32_t y,
+                                  int32_t z) {
+  capture::PcSample packet{};
+  packet.source = source;
+  packet.timestampUs = timestampUs;
+  packet.sampleSeq = sampleSeq;
+  packet.batchSeq = batchSeq;
+  packet.flags = flags;
+  packet.x = x;
+  packet.y = y;
+  packet.z = z;
+
+  if (serialQueue_ != nullptr) {
+    if (xQueueSend(serialQueue_, &packet, 0) != pdTRUE) {
+      ++serialQueueDrops_;
+    }
+  }
+}
+
+void MasterApp::writeSerialEmg48Sample(capture::Emg48Sample sample) {
+  if (emg48QueueDropFlagPending_) {
+    sample.flags |= capture::EMG48_FLAG_QUEUE_DROP;
+    emg48QueueDropFlagPending_ = false;
+  }
+  if (emg48ConfigVerifyFailures_ != 0) {
+    sample.flags |= capture::EMG48_FLAG_CONFIG_VERIFY_FAIL;
+  }
+  if (emg48Queue_ != nullptr) {
+    if (xQueueSend(emg48Queue_, &sample, 0) != pdTRUE) {
+      ++emg48QueueDrops_;
+      emg48QueueDropFlagPending_ = true;
+    }
+  }
+}
+
+void MasterApp::writeSerialImuWirePacket(const capture::ImuBatchWirePacket &wirePacket) {
+  if (imuPcQueue_ == nullptr || xQueueSend(imuPcQueue_, &wirePacket, 0) != pdTRUE) {
+    ++imuPcQueueDrops_;
+  }
+}
+
+// 阻塞式写完整个 USB CDC 数据块，处理 Serial.write 短写。
+void MasterApp::writeSerialBytesAll(const uint8_t *data, size_t size) {
+  // Serial.write 可能短写，循环补齐可避免 PC 端收到半个 batch。
+  if (serialWriteMux_ != nullptr) {
+    xSemaphoreTake(serialWriteMux_, portMAX_DELAY);
+  }
+  size_t writtenTotal = 0;
+  while (writtenTotal < size) {
+    const size_t written = Serial.write(data + writtenTotal, size - writtenTotal);
+    if (written == 0) {
+      ++serialWriteShorts_;
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+    writtenTotal += written;
+  }
+  if (serialWriteMux_ != nullptr) {
+    xSemaphoreGive(serialWriteMux_);
+  }
+}
+
+void MasterApp::enqueuePcSerialFrame(const uint8_t *data, size_t size) {
+  if (data == nullptr || size == 0 || size > PC_CONTROL_FRAME_MAX_SIZE) {
+    return;
+  }
+  if (serialFrameQueue_ == nullptr) {
+    ++serialFrameQueueDrops_;
+    return;
+  }
+
+  PcSerialTxFrame frame{};
+  frame.size = static_cast<uint16_t>(size);
+  memcpy(frame.bytes, data, size);
+  if (xQueueSend(serialFrameQueue_, &frame, 0) != pdTRUE) {
+    ++serialFrameQueueDrops_;
+  }
+}
+
+void MasterApp::cachePcDataFrame(uint8_t frameType,
+                                 uint16_t sequence,
+                                 const uint8_t *data,
+                                 size_t size) {
+  if (data == nullptr || size == 0 || size > capture::PC_SERIAL_MAX_PACKET_SIZE) {
+    return;
+  }
+  if (pcRetxCache_ == nullptr) {
+    return;
+  }
+  if (pcRetxMux_ != nullptr) {
+    xSemaphoreTake(pcRetxMux_, portMAX_DELAY);
+  }
+  PcRetxCacheEntry &entry = pcRetxCache_[pcRetxWriteIndex_];
+  pcRetxWriteIndex_ = (pcRetxWriteIndex_ + 1) % PC_RETX_CACHE_SIZE;
+  entry.valid = true;
+  entry.frameType = frameType;
+  entry.sequence = sequence;
+  entry.size = static_cast<uint16_t>(size);
+  memcpy(entry.bytes, data, size);
+  if (pcRetxMux_ != nullptr) {
+    xSemaphoreGive(pcRetxMux_);
+  }
+}
+
+bool MasterApp::resendPcDataFrame(uint8_t frameType, uint16_t sequence) {
+  if (pcRetxCache_ == nullptr) {
+    return false;
+  }
+  uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
+  uint16_t txSize = 0;
+
+  if (pcRetxMux_ != nullptr) {
+    xSemaphoreTake(pcRetxMux_, portMAX_DELAY);
+  }
+  for (size_t i = 0; i < PC_RETX_CACHE_SIZE; ++i) {
+    const PcRetxCacheEntry &entry = pcRetxCache_[i];
+    if (entry.valid && entry.frameType == frameType && entry.sequence == sequence &&
+        entry.size <= capture::PC_SERIAL_MAX_PACKET_SIZE) {
+      txSize = entry.size;
+      memcpy(txBuffer, entry.bytes, txSize);
+      break;
+    }
+  }
+  if (pcRetxMux_ != nullptr) {
+    xSemaphoreGive(pcRetxMux_);
+  }
+
+  if (txSize == 0) {
+    return false;
+  }
+  writeSerialBytesAll(txBuffer, txSize);
+  return true;
+}
+
+void MasterApp::handlePcRetransmitCommand(const String &raw) {
+  const bool isEmg = raw.indexOf("EMG") >= 0;
+  const int lastSpace = raw.lastIndexOf(' ');
+  if (lastSpace < 0 || lastSpace + 1 >= raw.length()) {
+    return;
+  }
+  const uint16_t sequence = static_cast<uint16_t>(raw.substring(lastSpace + 1).toInt());
+  resendPcDataFrame(isEmg ? capture::PC_MSG_EMG48_BATCH : capture::PC_MSG_IMU_WIRE_BATCH,
+                    sequence);
+}
+
+// 生成一条 SOURCE_DIAG 诊断帧，供 PC 端显示链路状态。
+void MasterApp::writeDiagFrame(uint32_t timestampUs,
+                               int32_t forwardedPerSec,
+                               int32_t hardErrorsPerSec,
+                               int32_t onlineSlaveCount,
+                               uint32_t linkEventsPerSec,
+                               uint16_t queueDropsPerSec,
+                               uint8_t ackFailsPerSec) {
+  // SOURCE_DIAG 复用 PcSample 的额外字段：
+  // sampleSeq=无线重传/重复/缺口事件，batchSeq=队列丢弃，flags=ACK 发送失败。
+  writeSerialSample(capture::SOURCE_DIAG,
+                    timestampUs,
+                    linkEventsPerSec,
+                    queueDropsPerSec,
+                    ackFailsPerSec,
+                    forwardedPerSec,
+                    hardErrorsPerSec,
+                    onlineSlaveCount);
+}
+
+void MasterApp::writePcSyncDiag(const capture::SyncDiagPacket &diag) {
+  uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
+  const size_t txSize = capture::buildPcSyncDiagPacket(diag, pcEventSequence_++, txBuffer);
+  enqueuePcSerialFrame(txBuffer, txSize);
+}
+
+void MasterApp::writePcStateEvent(const capture::StateAckPacket &event) {
+  uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
+  const size_t txSize = capture::buildPcStateEventPacket(event, pcEventSequence_++, txBuffer);
+  enqueuePcSerialFrame(txBuffer, txSize);
+}
+
+uint8_t MasterApp::currentState() const {
+  return state_;
+}
+
+uint32_t MasterApp::beaconIntervalMs(uint8_t state) const {
+  if (state == capture::STATE_SYNC || state == capture::STATE_STREAM_PENDING) {
+    return 20;
+  }
+  if (state == capture::STATE_STREAM) {
+    return 200;
+  }
+  return 2000;
+}
+
+void MasterApp::resetStreamingState() {
+  emgSampleSeq_ = 0;
+  emg48QueueDropFlagPending_ = false;
+  for (size_t i = 0; i < MAX_TRACKED_SLAVES; ++i) {
+    slaveRxStates_[i] = {};
+  }
+  if (serialQueue_ != nullptr) {
+    xQueueReset(serialQueue_);
+  }
+  if (emg48Queue_ != nullptr) {
+    xQueueReset(emg48Queue_);
+  }
+  if (imuPcQueue_ != nullptr) {
+    xQueueReset(imuPcQueue_);
+  }
+  if (serialFrameQueue_ != nullptr) {
+    xQueueReset(serialFrameQueue_);
+  }
+}
+
+void MasterApp::broadcastCommand(uint8_t targetState, uint32_t effectiveMasterTimeUs) {
+  if (commandTxMux_ != nullptr) xSemaphoreTake(commandTxMux_, portMAX_DELAY);
+  uint8_t packet[capture::COMMAND_WIRE_SIZE] = {};
+  capture::buildCommandPacket(++commandSeq_, targetState, effectiveMasterTimeUs, packet);
+  memcpy(retryCommand_, packet, sizeof(packet));
+  retryCommandNextMs_ = millis() + 100;
+  retryCommandUntilMs_ = millis() + 500;
+  retryCommandActive_ = true;
+  for (uint8_t i = 0; i < 6; ++i) {
+    esp_now_send(broadcastMac_, packet, sizeof(packet));
+    vTaskDelay(pdMS_TO_TICKS(8));
+  }
+  if (commandTxMux_ != nullptr) xSemaphoreGive(commandTxMux_);
+}
+
+void MasterApp::retryStateCommand() {
+  if (commandTxMux_ == nullptr || xSemaphoreTake(commandTxMux_, 0) != pdTRUE) return;
+  const uint32_t nowMs = millis();
+  if (retryCommandActive_ && static_cast<int32_t>(nowMs - retryCommandUntilMs_) >= 0) {
+    retryCommandActive_ = false;
+  }
+  if (retryCommandActive_ && static_cast<int32_t>(nowMs - retryCommandNextMs_) >= 0) {
+    // Reuse the sequence: Slaves ACK duplicates without resetting their sync/sample state.
+    // Serialize with new commands so an old retry cannot overtake a later STOP.
+    esp_now_send(broadcastMac_, retryCommand_, sizeof(retryCommand_));
+    retryCommandNextMs_ = nowMs + 50;
+  }
+  xSemaphoreGive(commandTxMux_);
+}
+
+bool MasterApp::applyRadioConfig(uint8_t channel, uint8_t rateCode) {
+  if (!capture::isValidRadioChannel(channel) || !capture::isValidRadioRate(rateCode)) {
+    return false;
+  }
+  if (commandTxMux_ != nullptr) {
+    xSemaphoreTake(commandTxMux_, portMAX_DELAY);
+    retryCommandActive_ = false;
+    xSemaphoreGive(commandTxMux_);
+  }
+  resetStreamingState();
+  state_ = capture::STATE_IDLE;
+  pendingStreamStartUs_ = 0;
+  currentChannel_ = channel;
+  currentRateCode_ = rateCode;
+  esp_wifi_set_channel(currentChannel_, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, radioRateFromCode(currentRateCode_));
+  return true;
+}
+
+void MasterApp::broadcastRadioConfig(uint8_t channel, uint8_t rateCode) {
+  uint8_t packet[capture::RADIO_CONFIG_WIRE_SIZE] = {};
+  capture::buildRadioConfigPacket(++radioConfigSeq_, channel, rateCode, RADIO_CONFIG_APPLY_DELAY_MS, packet);
+  for (uint8_t i = 0; i < RADIO_CONFIG_REPEAT_COUNT; ++i) {
+    esp_now_send(broadcastMac_, packet, sizeof(packet));
+    vTaskDelay(pdMS_TO_TICKS(12));
+  }
+}
+
+void MasterApp::transitionTo(uint8_t newState, uint32_t effectiveMasterTimeUs) {
+  if (newState == capture::STATE_IDLE || newState == capture::STATE_SYNC || newState == capture::STATE_STREAM_PENDING) {
+    resetStreamingState();
+  }
+  if (newState == capture::STATE_STREAM_PENDING && !ads_.verifyAndRepair()) {
+    ++emg48ConfigVerifyFailures_;
+  }
+  pendingStreamStartUs_ = effectiveMasterTimeUs;
+  state_ = newState;
+  broadcastCommand(newState, effectiveMasterTimeUs);
+
+  capture::StateAckPacket event{};
+  event.source = capture::SOURCE_EMG;
+  event.state = newState;
+  event.commandSeq = commandSeq_;
+  event.effectiveMasterTimeUs = effectiveMasterTimeUs;
+  writePcStateEvent(event);
+}
+
+void MasterApp::handlePcCommand(String raw) {
+  raw.trim();
+  raw.toUpperCase();
+  if (raw.length() == 0) {
+    return;
+  }
+  if (raw == "PING") {
+    capture::StateAckPacket event{};
+    event.source = capture::SOURCE_EMG;
+    event.state = currentState();
+    event.commandSeq = commandSeq_;
+    event.effectiveMasterTimeUs = pendingStreamStartUs_;
+    writePcStateEvent(event);
+    return;
+  }
+  if (raw.startsWith("RESEND") || raw.startsWith("NACK")) {
+    handlePcRetransmitCommand(raw);
+    return;
+  }
+  if (raw.startsWith("RADIO") || raw.startsWith("WIFI")) {
+    handlePcRadioCommand(raw);
+    return;
+  }
+  if (raw == "START_SYNC") {
+    transitionTo(capture::STATE_SYNC, 0);
+    return;
+  }
+  if (raw == "START_STREAM") {
+    transitionTo(capture::STATE_STREAM_PENDING, micros() + 500000UL);
+    return;
+  }
+  if (raw == "STOP") {
+    transitionTo(capture::STATE_IDLE, 0);
+    return;
+  }
+}
+
+void MasterApp::handlePcRadioCommand(const String &raw) {
+  const int firstSpace = raw.indexOf(' ');
+  if (firstSpace < 0) {
+    return;
+  }
+  const int secondSpace = raw.indexOf(' ', firstSpace + 1);
+  if (secondSpace < 0) {
+    return;
+  }
+
+  String channelText = raw.substring(firstSpace + 1, secondSpace);
+  String rateText = raw.substring(secondSpace + 1);
+  channelText.trim();
+  rateText.trim();
+
+  const int channelValue = channelText.toInt();
+  uint8_t rateCode = 0;
+  if (rateText == "1" || rateText == "1M" || rateText == "1MBPS") {
+    rateCode = capture::ESPNOW_RATE_1M;
+  } else if (rateText == "2" || rateText == "2M" || rateText == "2MBPS") {
+    rateCode = capture::ESPNOW_RATE_2M;
+  }
+
+  if (!capture::isValidRadioChannel(static_cast<uint8_t>(channelValue)) || !capture::isValidRadioRate(rateCode)) {
+    return;
+  }
+
+  if (currentState() != capture::STATE_IDLE) {
+    transitionTo(capture::STATE_IDLE, 0);
+  }
+  broadcastRadioConfig(static_cast<uint8_t>(channelValue), rateCode);
+  vTaskDelay(pdMS_TO_TICKS(RADIO_CONFIG_APPLY_DELAY_MS + 80));
+  applyRadioConfig(static_cast<uint8_t>(channelValue), rateCode);
+
+  capture::StateAckPacket event{};
+  event.source = capture::SOURCE_EMG;
+  event.state = capture::STATE_IDLE;
+  event.commandSeq = commandSeq_;
+  event.effectiveMasterTimeUs = 0;
+  writePcStateEvent(event);
+}
+
+void MasterApp::broadcastBeacon(uint32_t nowUs) {
+  capture::BeaconPacket beacon{};
+  beacon.type = capture::MSG_TYPE_BEACON;
+  beacon.beaconSeq = beaconSeq_++;
+  beacon.state = currentState();
+  beacon.masterTimeUs = nowUs;
+  esp_now_send(broadcastMac_, reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
+}
+
+void MasterApp::handleSyncProbe(const SlaveRxItem &item) {
+  capture::SyncProbePacket probe{};
+  if (!capture::decodeSyncProbePacket(item.bytes, item.len, probe)) {
+    return;
+  }
+  if (!ensureEspNowPeer(item.mac)) {
+    return;
+  }
+
+  capture::SyncReplyPacket reply{};
+  reply.source = probe.source;
+  reply.probeSeq = probe.probeSeq;
+  reply.slaveT1LocalUs = probe.slaveT1LocalUs;
+  reply.masterT2RecvUs = item.rxTimeUs;
+  reply.masterT3SendUs = micros();
+
+  uint8_t packet[capture::SYNC_REPLY_WIRE_SIZE] = {};
+  capture::buildSyncReplyPacket(reply, packet);
+  esp_now_send(item.mac, packet, sizeof(packet));
+}
+
+// 从串口队列取样本并合批编码为 USB CDC 帧。
+void MasterApp::serialTxTask() {
+  capture::PcSample sample{};
+  capture::PcSample batch[capture::PC_SERIAL_MAX_SAMPLES] = {};
+  capture::Emg48Sample emgSample{};
+  capture::Emg48Sample pendingEmgSample{};
+  capture::Emg48Sample emgBatch[capture::PC_EMG48_MAX_SAMPLES] = {};
+  capture::ImuBatchWirePacket imuWirePacket{};
+  PcSerialTxFrame frame{};
+  uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
+  uint8_t emgBatchesSinceImu = 0;
+  bool hasPendingEmgSample = false;
+
+  for (;;) {
+    const uint8_t state = currentState();
+    if (state != capture::STATE_STREAM) {
+      hasPendingEmgSample = false;
+    }
+    const TickType_t eventWait = state == capture::STATE_STREAM ? 0 : pdMS_TO_TICKS(2);
+    if (serialFrameQueue_ != nullptr &&
+        xQueueReceive(serialFrameQueue_, &frame, eventWait) == pdTRUE) {
+      writeSerialBytesAll(frame.bytes, frame.size);
+      continue;
+    }
+
+    // Diag 只有约 1 帧/s，优先发送不会影响数据吞吐，还能及时暴露启动/队列故障。
+    if (serialQueue_ != nullptr && xQueueReceive(serialQueue_, &sample, 0) == pdTRUE) {
+      uint8_t sampleCount = 0;
+      batch[sampleCount++] = sample;
+      while (sampleCount < capture::PC_SERIAL_MAX_SAMPLES &&
+             xQueueReceive(serialQueue_, &sample, 0) == pdTRUE) {
+        batch[sampleCount++] = sample;
+      }
+      const uint8_t sequence = pcSerialSequence_++;
+      const size_t txSize = capture::buildPcBatchPacket(batch, sampleCount, sequence, txBuffer);
+      writeSerialBytesAll(txBuffer, txSize);
+      continue;
+    }
+
+    const bool imuWaiting = imuPcQueue_ != nullptr && uxQueueMessagesWaiting(imuPcQueue_) > 0;
+    const bool emgWaiting = hasPendingEmgSample ||
+                            (emg48Queue_ != nullptr && uxQueueMessagesWaiting(emg48Queue_) > 0);
+    if (imuWaiting && (!emgWaiting || emgBatchesSinceImu >= EMG_BATCHES_PER_IMU_SERVICE) &&
+        xQueueReceive(imuPcQueue_, &imuWirePacket, 0) == pdTRUE) {
+      const uint8_t sequence = pcImuSequence_++;
+      const size_t txSize = capture::buildPcImuWirePacket(imuWirePacket, sequence, txBuffer);
+      cachePcDataFrame(capture::PC_MSG_IMU_WIRE_BATCH, sequence, txBuffer, txSize);
+      writeSerialBytesAll(txBuffer, txSize);
+      emgBatchesSinceImu = 0;
+      continue;
+    }
+
+    if (hasPendingEmgSample ||
+        (emg48Queue_ != nullptr &&
+         xQueueReceive(emg48Queue_, &emgSample, pdMS_TO_TICKS(1)) == pdTRUE)) {
+      if (hasPendingEmgSample) {
+        emgSample = pendingEmgSample;
+        hasPendingEmgSample = false;
+      }
+      uint8_t sampleCount = 0;
+      emgBatch[sampleCount++] = emgSample;
+      while (sampleCount < capture::PC_EMG48_MAX_SAMPLES &&
+             xQueueReceive(emg48Queue_, &emgSample, pdMS_TO_TICKS(1)) == pdTRUE) {
+        const bool contiguous =
+            emgSample.sampleSeq == emgBatch[0].sampleSeq + sampleCount &&
+            emgSample.drdyCount == emgBatch[0].drdyCount + sampleCount;
+        if (!contiguous) {
+          pendingEmgSample = emgSample;
+          hasPendingEmgSample = true;
+          break;
+        }
+        emgBatch[sampleCount++] = emgSample;
+      }
+      const uint16_t sequence = pcEmg48Sequence_++;
+      const size_t txSize = capture::buildPcEmg48BatchPacket(emgBatch, sampleCount, sequence, txBuffer);
+      cachePcDataFrame(capture::PC_MSG_EMG48_BATCH, sequence, txBuffer, txSize);
+      writeSerialBytesAll(txBuffer, txSize);
+      emg48ForwardedSamples_ += sampleCount;
+      if (emgBatchesSinceImu < 255) {
+        ++emgBatchesSinceImu;
+      }
+      continue;
+    }
+
+    if (imuPcQueue_ != nullptr && xQueueReceive(imuPcQueue_, &imuWirePacket, pdMS_TO_TICKS(1)) == pdTRUE) {
+      const uint8_t sequence = pcImuSequence_++;
+      const size_t txSize = capture::buildPcImuWirePacket(imuWirePacket, sequence, txBuffer);
+      cachePcDataFrame(capture::PC_MSG_IMU_WIRE_BATCH, sequence, txBuffer, txSize);
+      writeSerialBytesAll(txBuffer, txSize);
+      emgBatchesSinceImu = 0;
+    }
+  }
+}
+
+// 处理 Beacon 广播、Slave batch 解码、ACK 回复和每秒诊断统计。
+void MasterApp::wirelessTask() {
+  SlaveRxItem rxItem{};
+  capture::ImuDecodedSample decodedSamples[capture::IMU_BATCH_SIZE] = {};
+  uint8_t decodedCount = 0;
+  uint8_t decodedSource = 0;
+  uint16_t decodedBatchSeq = 0;
+  uint32_t decodedSampleStartSeq = 0;
+  uint8_t decodedFlags = 0;
+
+  uint32_t lastForwardedSamples = 0;
+  uint32_t lastDecodeFails = 0;
+  uint32_t lastCrcFails = 0;
+  uint32_t lastQueueDrops = 0;
+  uint32_t lastSerialQueueDrops = 0;
+  uint32_t lastSerialFrameQueueDrops = 0;
+  uint32_t lastSerialWriteShorts = 0;
+  uint32_t lastRegistryDrops = 0;
+  uint32_t lastDuplicatePackets = 0;
+  uint32_t lastRetransmitPackets = 0;
+  uint32_t lastMissingPackets = 0;
+  uint32_t lastAckSendFails = 0;
+  uint32_t lastEmg48QueueDrops = 0;
+  uint32_t lastEmg48Overruns = 0;
+  uint32_t lastEmg48ConfigVerifyFailures = 0;
+  uint32_t lastImuPcQueueDrops = 0;
+  uint32_t lastStartupFaults = 0;
+  uint32_t lastBeaconMs = 0;
+  uint32_t lastEspNowRetryMs = 0;
+  uint32_t lastDiagMs = millis();
+
+  for (;;) {
+    const uint32_t nowMs = millis();
+    if (espNowReady_) retryStateCommand();
+    if (!espNowReady_ && static_cast<uint32_t>(nowMs - lastEspNowRetryMs) >= 2000) {
+      espNowReady_ = initEspNow();
+      if (!espNowReady_) {
+        ++startupFaults_;
+      }
+      lastEspNowRetryMs = nowMs;
+    }
+    const uint8_t state = currentState();
+    if (espNowReady_ && static_cast<uint32_t>(nowMs - lastBeaconMs) >= beaconIntervalMs(state)) {
+      broadcastBeacon(micros());
+      lastBeaconMs = nowMs;
+    }
+
+    if (state == capture::STATE_STREAM_PENDING &&
+        static_cast<int32_t>(micros() - pendingStreamStartUs_) >= 0) {
+      resetStreamingState();
+      state_ = capture::STATE_STREAM;
+      capture::StateAckPacket event{};
+      event.source = capture::SOURCE_EMG;
+      event.state = capture::STATE_STREAM;
+      event.commandSeq = commandSeq_;
+      event.effectiveMasterTimeUs = pendingStreamStartUs_;
+      writePcStateEvent(event);
+    }
+
+    while (slaveRxQueue_ != nullptr && xQueueReceive(slaveRxQueue_, &rxItem, 0) == pdTRUE) {
+      if (rxItem.len == 0) {
+        continue;
+      }
+
+      if (rxItem.bytes[0] == capture::MSG_TYPE_SYNC_PROBE) {
+        handleSyncProbe(rxItem);
+        continue;
+      }
+
+      if (rxItem.bytes[0] == capture::MSG_TYPE_STATE_ACK) {
+        capture::StateAckPacket event{};
+        if (capture::decodeStateAckPacket(rxItem.bytes, rxItem.len, event)) {
+          writePcStateEvent(event);
+          trackSlave(rxItem.mac, event.source, micros(), 0);
+        }
+        continue;
+      }
+
+      if (rxItem.bytes[0] == capture::MSG_TYPE_SYNC_DIAG) {
+        capture::SyncDiagPacket diag{};
+        if (capture::decodeSyncDiagPacket(rxItem.bytes, rxItem.len, diag)) {
+          writePcSyncDiag(diag);
+          trackSlave(rxItem.mac, diag.source, micros(), 0);
+        }
+        continue;
+      }
+
+      if (rxItem.len != capture::IMU_BATCH_WIRE_SIZE || currentState() != capture::STATE_STREAM) {
+        continue;
+      }
+
+      capture::ImuBatchWirePacket wirePacket{};
+      memcpy(wirePacket.bytes, rxItem.bytes, capture::IMU_BATCH_WIRE_SIZE);
+      const capture::DecodeStatus status = capture::decodeImuBatchPacket(wirePacket,
+                                                                         decodedSamples,
+                                                                         decodedCount,
+                                                                         decodedSource,
+                                                                         decodedBatchSeq,
+                                                                         decodedSampleStartSeq,
+                                                                         decodedFlags);
+      if (status != capture::DECODE_OK) {
+        ++slaveDecodeFails_;
+        if (status == capture::DECODE_BAD_CRC) {
+          ++slaveCrcFails_;
+        }
+        continue;
+      }
+
+      const uint32_t nowUs = micros();
+      SlaveRxState *rxState = getSlaveRxState(rxItem.mac, decodedSource);
+      if (rxState == nullptr) {
+        continue;
+      }
+
+      bool duplicate = false;
+      markBatchReceived(*rxState, decodedBatchSeq, decodedSampleStartSeq, decodedFlags, duplicate);
+      rxState->ackPending = true;
+
+      trackSlave(rxItem.mac, decodedSource, nowUs, duplicate ? 0 : decodedCount);
+      if (duplicate) {
+        // 重复 batch 仍要 ACK，但不能再次写入 PC，否则 CSV 会出现重复 sample_seq。
+        continue;
+      }
+
+      // 该包已经完成 CRC、source、count 和重复检查。PC 端直接复用 Slave 的紧凑
+      // wire format 解码，可保留全部 1 kHz IMU 点并显著降低 USB 带宽。
+      writeSerialImuWirePacket(wirePacket);
+      slaveForwardedSamples_ += decodedCount;
+    }
+
+    sendPendingAcks(micros());
+
+    if (static_cast<uint32_t>(nowMs - lastDiagMs) >= 1000) {
+      const uint32_t nowUs = micros();
+      const int32_t onlineSlaves = countOnlineSlaves(nowUs);
+      const int32_t forwardedDelta = static_cast<int32_t>(slaveForwardedSamples_ - lastForwardedSamples);
+      const uint32_t emgQueueDropDelta = emg48QueueDrops_ - lastEmg48QueueDrops;
+      const uint32_t emgOverrunDelta = emg48Overruns_ - lastEmg48Overruns;
+      const uint32_t emgConfigFailDelta = emg48ConfigVerifyFailures_ - lastEmg48ConfigVerifyFailures;
+      const uint32_t imuPcQueueDropDelta = imuPcQueueDrops_ - lastImuPcQueueDrops;
+      const uint32_t startupFaultDelta = startupFaults_ - lastStartupFaults;
+      const uint32_t queueDropDelta = (slaveQueueDrops_ - lastQueueDrops) +
+                                      (serialQueueDrops_ - lastSerialQueueDrops) +
+                                      (serialFrameQueueDrops_ - lastSerialFrameQueueDrops) +
+                                      emgQueueDropDelta +
+                                      imuPcQueueDropDelta;
+      const uint32_t ackFailDelta = ackSendFails_ - lastAckSendFails;
+      const uint32_t linkEventDelta = (slaveDuplicatePackets_ - lastDuplicatePackets) +
+                                      (slaveRetransmitPackets_ - lastRetransmitPackets) +
+                                      (slaveMissingPackets_ - lastMissingPackets) +
+                                      emgOverrunDelta;
+      const uint32_t decodeFailDelta = slaveDecodeFails_ - lastDecodeFails;
+      const int32_t hardErrorDelta = static_cast<int32_t>(decodeFailDelta +
+                                                          queueDropDelta +
+                                                          emgOverrunDelta +
+                                                          emgConfigFailDelta +
+                                                          startupFaultDelta +
+                                                          (serialWriteShorts_ - lastSerialWriteShorts) +
+                                                          (slaveRegistryDrops_ - lastRegistryDrops) +
+                                                          ackFailDelta);
+
+      writeDiagFrame(nowUs,
+                     forwardedDelta,
+                     hardErrorDelta,
+                     onlineSlaves,
+                     linkEventDelta,
+                     static_cast<uint16_t>(min(queueDropDelta, static_cast<uint32_t>(UINT16_MAX))),
+                     static_cast<uint8_t>(min(ackFailDelta, static_cast<uint32_t>(UINT8_MAX))));
+
+      lastForwardedSamples = slaveForwardedSamples_;
+      lastDecodeFails = slaveDecodeFails_;
+      lastCrcFails = slaveCrcFails_;
+      lastQueueDrops = slaveQueueDrops_;
+      lastSerialQueueDrops = serialQueueDrops_;
+      lastSerialFrameQueueDrops = serialFrameQueueDrops_;
+      lastSerialWriteShorts = serialWriteShorts_;
+      lastRegistryDrops = slaveRegistryDrops_;
+      lastDuplicatePackets = slaveDuplicatePackets_;
+      lastRetransmitPackets = slaveRetransmitPackets_;
+      lastMissingPackets = slaveMissingPackets_;
+      lastAckSendFails = ackSendFails_;
+      lastEmg48QueueDrops = emg48QueueDrops_;
+      lastEmg48Overruns = emg48Overruns_;
+      lastEmg48ConfigVerifyFailures = emg48ConfigVerifyFailures_;
+      lastImuPcQueueDrops = imuPcQueueDrops_;
+      lastStartupFaults = startupFaults_;
+      lastDiagMs = nowMs;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+// 等待 ADS1298 DRDY 通知，读取 48CH EMG 并送入专用串口队列。
+void MasterApp::sensorTask() {
+  sensorTaskHandle_ = xTaskGetCurrentTaskHandle();
+
+  for (;;) {
+    const uint32_t pendingDrdy = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    uint8_t flags = 0;
+    if (pendingDrdy > 1) {
+      emg48Overruns_ += pendingDrdy - 1;
+      flags |= capture::EMG48_FLAG_OVERRUN;
+    }
+
+    if (currentState() != capture::STATE_STREAM) {
+      continue;
+    }
+
+    capture::Emg48Sample sample{};
+    sample.timestampUs = micros();
+    sample.sampleSeq = emgSampleSeq_++;
+    sample.drdyCount = emgDrdyCount_;
+    sample.flags = flags;
+
+    if (ads_.readChannels(sample.channels)) {
+      writeSerialEmg48Sample(sample);
+    }
+  }
+}
+
+void MasterApp::serialCommandTask() {
+  String line;
+  line.reserve(48);
+  for (;;) {
+    while (Serial.available() > 0) {
+      const char ch = static_cast<char>(Serial.read());
+      if (ch == '\n' || ch == '\r') {
+        if (line.length() > 0) {
+          handlePcCommand(line);
+          line = "";
+        }
+      } else if (line.length() < 47) {
+        line += ch;
+      } else {
+        line = "";
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}

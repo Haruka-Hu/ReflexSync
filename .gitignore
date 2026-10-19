@@ -1,0 +1,62 @@
+# Build products, local environments, editor state
+.pio/
+.pixi/
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Recordings, generated output, diagnostics and local references
+/data/
+/outputs/
+/diagnostics/
+/recordings/
+/captures/
+/exports/
+/tmp/
+/ref/
+*.csv
+*.tsv
+*.bin
+*.elf
+*.hex
+*.uf2
+*.npy
+*.npz
+*.mat
+*.h5
+*.hdf5
+*.xlsx
+*.log
+*.zip
+*.tar
+*.tar.gz
+*.7z
+mvc_calibration_*.json
+hammer_[0-9]*.json
+
+# Credentials and local overrides
+.env
+.env.*
+*.pem
+*.key
+
+# Publish current usage docs; keep local history/paths/measurements private
+/notes/*
+!/notes/电机控制与移植说明.md
+!/notes/发布检查说明.md
+
+# Generated figures, multimedia and metadata; keep the intentional motor config
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+*.mp4
+*.avi
+*.wav
+*.parquet
+*.json
+*.jsonl
+!/hammer_profiles.json

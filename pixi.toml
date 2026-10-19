@@ -1,0 +1,35 @@
+[workspace]
+name = "espnow-sync-host"
+version = "0.1.0"
+description = "Host tools for ESP32-S3 ESP-NOW synchronized IMU capture"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "win-64"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+pyserial = ">=3.5,<4"
+numpy = ">=1.26,<3"
+scipy = ">=1.13,<2"
+matplotlib = ">=3.8,<4"
+pyqtgraph = ">=0.13.7,<0.14"
+pyside6 = ">=6.7,<7"
+pyopengl = ">=3.1.7,<4"
+pandas = ">=3.0.2,<4"
+
+[pypi-dependencies]
+bleak = ">=0.22,<1"
+platformio = ">=6.1.19,<7"  # 把它加到这里
+
+[tasks]
+scope48-mvc = "python tools/scope48_mvc.py"
+motor-host = "python tools/motor_controller.py"
+build-master = "platformio run -e master"
+build-slave-01 = "platformio run -e slave-01"
+build-slave-02 = "platformio run -e slave-02"
+build-motor = "platformio run -e motor"
+upload-master = "python scripts/upload_master_tinyusb.py"
+upload-slave-01 = "platformio run -e slave-01 -t upload"
+upload-slave-01-biger-buffer = "platformio run -e slave-01-biger-buffer -t upload"
+upload-slave-02 = "platformio run -e slave-02 -t upload"
+upload-slave-02-biger-buffer = "platformio run -e slave-02-biger-buffer -t upload"
+upload-motor = "platformio run -e motor -t upload"
