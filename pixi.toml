@@ -21,8 +21,10 @@ bleak = ">=0.22,<1"
 platformio = ">=6.1.19,<7"  # 把它加到这里
 
 [tasks]
+csv-mat = "python tools/csv_mat_gui.py"
 scope48-mvc = "python tools/scope48_mvc.py"
 motor-host = "python tools/motor_controller.py"
+motor-sweep = "python scripts/motor_speed_sweep.py"
 build-master = "platformio run -e master"
 build-slave-01 = "platformio run -e slave-01"
 build-slave-02 = "platformio run -e slave-02"

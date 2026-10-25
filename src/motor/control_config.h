@@ -8,9 +8,14 @@ constexpr uint32_t ControlPeriodUs = 1000;
 constexpr uint32_t MaxControlGapUs = 50000; // existing abnormal-gap check
 constexpr uint32_t RetractTimeoutMs = 8000, StrikeTimeoutMs = 1800, ReadyStableMs = 130;
 constexpr float MaxPwm = 1000, AngleTolerance = 1.2f, StillSpeed = 20;
+// Independent of contact detection: prevent another revolution if the target
+// moves or a drop is missed. No subsequent automatic action after an abort.
+constexpr float StrikeForwardLimitDeg = 8, StrikeReverseMarginDeg = 5;
+constexpr float HomeTravelLimitDeg = 12;
 constexpr float DefaultRetractAngle = 60, DefaultStrikeSpeed = 200;
 // One continuous position law for both approach and READY; no tolerance-boundary switch.
-constexpr float PositionKp = 12, PositionKi = 15, PositionStaticKi = 40, PositionKd = 2.5f;
+// Build static load effort before the unchanged 750ms no-progress deadline.
+constexpr float PositionKp = 12, PositionKi = 15, PositionStaticKi = 80, PositionKd = 2.5f;
 constexpr float PositionFrictionPwm = 105, PositionRetractPerDeg = 2;
 constexpr float PositionFrictionWidthDeg = 1, PositionIntegralZoneDeg = 20;
 constexpr float PositionIntegralSpeed = 40, PositionIntegralLimit = 300;

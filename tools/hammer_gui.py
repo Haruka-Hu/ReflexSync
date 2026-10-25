@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""USB/BLE rotary hammer controller: pixi run gui."""
+"""USB/BLE rotary hammer controller: pixi run motor-host."""
 from __future__ import annotations
 
 import argparse
@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 from serial.tools import list_ports
 
-from hammer_protocol import TracePoint, analyze_trace, fields
+from hammer_protocol import TraceReceiver, TraceReplacedError, analyze_trace, fields
 from hammer_transport import DEFAULT_DEVICE, TransportWorker
 
 CONFIG_FILE = Path(__file__).resolve().parents[1] / 'hammer_profiles.json'
@@ -35,6 +35,16 @@ class MainWindow(QMainWindow):
     def __init__(self, worker=None):
         super().__init__()
         self.worker = worker or TransportWorker()
+        self.session_log = None
+        self.session_log_path = None
+        if worker is None:
+            try:
+                directory=Path(__file__).resolve().parents[1]/'outputs'/'motor_logs'
+                directory.mkdir(parents=True,exist_ok=True)
+                self.session_log_path=directory/f'motor_{dt.datetime.now():%Y%m%d_%H%M%S_%f}.log'
+                self.session_log=self.session_log_path.open('a',encoding='utf-8')
+            except OSError:
+                pass
         self.connected = self.connecting = False
         self.state = 'DISCONNECTED'
         self.zeroed = False
@@ -50,6 +60,9 @@ class MainWindow(QMainWindow):
         self.last_jog_send = 0
         self.pending = None
         self.trace_busy = False
+        self.trace_complete = False
+        self.trace_receiver = None
+        self.trace_request_serial = 0
         self.trace_points = {}
         self.trace_shot = -1
         self.trace_total = 0
@@ -82,6 +95,7 @@ class MainWindow(QMainWindow):
         self.timer.start(40)
         self.refresh_ports()
         self._buttons()
+        if self.session_log:self._append('运行日志：'+str(self.session_log_path))
 
     @staticmethod
     def _load_profiles():
@@ -239,7 +253,7 @@ class MainWindow(QMainWindow):
 
     def _connected(self, connected):
         self.connected=connected; self.connecting=False; self.ready=False; self.connection_error=""
-        self.pending=None; self.trace_busy=False; self.status_inflight=False; self.jog_speed=0
+        self.pending=None; self.trace_busy=False; self.trace_complete=False; self.status_inflight=False; self.jog_speed=0
         self.received_status=False; self.zeroed=False; self.homing=False
         self.confirmed_settings={}; self.confirmed_tuning={}; self.firmware_info={}
         self.state='CONNECTING' if connected else 'DISCONNECTED'
@@ -281,7 +295,7 @@ class MainWindow(QMainWindow):
         self.trace_button.setEnabled(idle and not self.trace_busy)
         self.cancel_trace_button.setEnabled(self.trace_busy)
         self.sync_button.setEnabled(self.connected and self.pending is None and self.state in ('IDLE','CONNECTING'))
-        self.export_button.setEnabled(bool(self.trace_points) and len(self.trace_points)==self.trace_total and not self.trace_busy)
+        self.export_button.setEnabled(self.trace_complete and not self.trace_busy)
         names={'IDLE':'空闲','RETRACT':'回撤 / 手动移动','READY':'回撤已到位','STRIKE':'叩击中','CONNECTING':'正在确认设备','DISCONNECTED':'未连接'}
         self.state_label.setText(names.get(self.state,self.state)+(' · 慢速复位中' if self.homing else '')+(' · 零点有效' if self.zeroed else ' · 待归零'))
         if not self.connected:hint='先选择 USB 串口或 BLE，点击连接。'
@@ -304,7 +318,9 @@ class MainWindow(QMainWindow):
         self.worker.send(command); self._append('→ '+command); self._buttons(); return True
 
     def cancel_trace(self):
-        if self.trace_busy:self._append('已取消轨迹读取，未下载完整的轨迹不会作为完整结果导出')
+        if self.trace_busy:
+            self.trace_complete=False
+            self._append('已取消轨迹读取，未下载完整的轨迹不会作为完整结果导出')
         self.trace_busy=False
 
     def fire(self):
@@ -399,6 +415,7 @@ class MainWindow(QMainWindow):
             'STRIKING':'正在叩击',
             'SPEED_DROP':'检测到速度突降，已撤驱动',
             'TIMEOUT_NO_DROP':'下击超时，未检测到接触；已撤驱动',
+            'BLE_DISCONNECT':'蓝牙断开，已制动；需要重新连接并确认零位',
             'ZEROED':'已将当前物理位置设为零位',
             'HOMING':'正在慢速接近靶面', 'HOME_DONE':'慢速复位完成',
             'JOGGING':'按住手动移动中', 'JOG_RELEASE':'手动移动刷新停止，已撤驱动',
@@ -406,6 +423,10 @@ class MainWindow(QMainWindow):
         if reason in descriptions:self.motion_label.setText('本次动作：'+descriptions[reason])
 
     def _line(self,line):
+        self._write_session_log('RX '+line)
+        if line.startswith(('TRACE ', 'TRACE_BEGIN ', 'TRACE_END ')):
+            self._trace_line(line)
+            return
         p=fields(line)
         previous_state=self.state
         try:
@@ -421,6 +442,8 @@ class MainWindow(QMainWindow):
                 if self.state in ('RETRACT','READY','STRIKE') and not self.trace_busy:
                     self.live.append((time.monotonic()*1000,float(p['angle']),float(p['speed']),float(p['raw']),float(p['pwm'])))
                     self._plot_live()
+            elif line.startswith('DIAG '):
+                self.feedback_label.setToolTip('编码器/链路诊断：'+line[5:])
             elif line.startswith('PARAMS '):
                 self.confirmed_settings={k:float(p[k]) for k in ('retract_angle','strike_speed')}
                 if not self.ready:
@@ -444,28 +467,15 @@ class MainWindow(QMainWindow):
                 self.state='IDLE'; self.zeroed=p.get('zeroed')=='1'; self.shot_event=p
                 self.trace_target=float(p['target_speed'])
                 self.result_label.setText('结束：'+p['reason']+'；正在读取轨迹…')
-                QTimer.singleShot(100,self.download_trace)
+                QTimer.singleShot(100,lambda shot=int(p['shot']):self.download_trace(expected_shot=shot))
             elif line.startswith('EVT ABORT '):
                 self.state='IDLE'; self.zeroed=False; self.homing=False; self.jog_speed=0; self.shot_event=p
                 self.result_label.setText('已停止：'+p['reason'])
                 self._motion_reason(p['reason'])
-            elif line.startswith('TRACE_BEGIN ') and self.trace_busy:
-                shot=int(p['shot'])
-                if self.trace_shot>=0 and self.trace_shot!=shot: raise ValueError('轨迹已被下一次叩击覆盖')
-                self.trace_shot=shot; self.trace_total=int(p['total']); self.trace_target=float(p['target'])
-                self.trace_window=int(p['window_us'])
-                self.result_label.setText(f'正在读取轨迹：{len(self.trace_points)} / {self.trace_total} 点；可取消')
-                if 'reason' in p:
-                    self.shot_event={k:p[k] for k in ('shot','reason','contact_candidate','target')}
-                if all(k in p for k in (*TUNING_KEYS,'retract_angle')):
-                    self.trace_settings={'settings':{'retract_angle':float(p['retract_angle']),
-                        'strike_speed':float(p['target'])},'tuning':{k:float(p[k]) for k in TUNING_KEYS}}
-            elif line.startswith('TRACE ') and self.trace_busy and int(p['shot'])==self.trace_shot:
-                point=TracePoint.parse(line); self.trace_points[point.index]=point
-            elif line.startswith('TRACE_END ') and self.trace_busy and int(p['shot'])==self.trace_shot:
-                if int(p['total'])!=self.trace_total: raise ValueError('轨迹总数不一致')
-                if int(p['next'])>self.trace_offset or self.trace_total==0:
-                    self._next_trace_chunk()
+            elif line.startswith('ERR TRACE ') and self.trace_busy:
+                self.trace_busy=False; self._error(line)
+            elif line.startswith('ERR TRACE '):
+                self._append('忽略已取消读取的回复：'+line)
             elif line.startswith('ERR '):
                 if self.pending and self.pending[0]=='INFO':
                     line='固件不支持当前协议，请烧录本工程固件后重新连接（原始回复：'+line+'）'
@@ -474,8 +484,10 @@ class MainWindow(QMainWindow):
                 if self.trace_busy: self.trace_busy=False
                 self._error(line)
         except (KeyError,ValueError,OverflowError) as exc:
-            self.pending=None; self.trace_busy=False; self._error(f'协议解析失败：{exc}')
-        if not line.startswith(('STATUS ','TRACE ','TRACE_BEGIN ','TRACE_END ','OK JOG ')):
+            # A malformed unsolicited event/telemetry line cannot cancel an ACK.
+            self._error(f'协议解析失败，已忽略该行：{exc}；{line[:160]}')
+            return
+        if not line.startswith(('STATUS ','TRACE ','TRACE_BEGIN ','TRACE_END ','OK JOG ','DIAG ')):
             self._append('← '+line)
         if self.pending is not None and line.startswith(self.pending[1]):
             callback=self.pending[2]; self.pending=None
@@ -483,19 +495,48 @@ class MainWindow(QMainWindow):
         self._buttons()
         if previous_state=='STRIKE' and self.state=='IDLE' and not line.startswith('EVT SHOT'):
             if int(p.get('samples','0'))>0 and int(p.get('shot','-1'))!=self.trace_shot:
-                QTimer.singleShot(150,self.download_trace)
+                QTimer.singleShot(150,lambda shot=int(p['shot']):self.download_trace(expected_shot=shot))
 
-    def download_trace(self):
+    def _trace_line(self,line):
+        if not self.trace_busy or self.trace_receiver is None:return
+        try:
+            ended=self.trace_receiver.feed(line)
+        except TraceReplacedError as exc:
+            self.trace_busy=False; self._error(str(exc)); return
+        except (KeyError,ValueError,OverflowError) as exc:
+            # Keep the action ACK transaction and all verified rows intact.
+            self._append(f'忽略损坏的轨迹分包，等待重读：{exc}；{line[:160]}')
+            return
+        receiver=self.trace_receiver
+        if receiver.total is not None:
+            p=receiver.metadata
+            self.trace_shot=receiver.shot; self.trace_total=receiver.total
+            self.trace_target=float(p['target']); self.trace_window=int(p['window_us'])
+            self.result_label.setText(f'正在读取轨迹：{len(self.trace_points)} / {self.trace_total} 点；可取消')
+            if 'reason' in p and 'contact_candidate' in p:
+                self.shot_event={k:p[k] for k in ('shot','reason','contact_candidate','target')}
+            if all(k in p for k in (*TUNING_KEYS,'retract_angle')):
+                self.trace_settings={'settings':{'retract_angle':float(p['retract_angle']),
+                    'strike_speed':float(p['target'])},'tuning':{k:float(p[k]) for k in TUNING_KEYS}}
+        if ended:self._next_trace_chunk()
+        self._buttons()
+
+    def download_trace(self,checked=False,*,expected_shot=-1):
         if not self.connected or self.state!='IDLE' or self.trace_busy: return
         if self.pending is not None:
-            QTimer.singleShot(150,self.download_trace); return
-        self.trace_busy=True; self.trace_points={}; self.trace_shot=-1; self.trace_total=0
+            QTimer.singleShot(150,lambda:self.download_trace(expected_shot=expected_shot)); return
+        features=set(self.firmware_info.get('features','').split(','))
+        self.trace_receiver=TraceReceiver(require_crc='TRACE_CRC' in features,
+            request_ids='TRACE_REQUEST_ID' in features,shot=expected_shot)
+        self.trace_busy=True; self.trace_complete=False; self.metrics={}
+        self.trace_points=self.trace_receiver.points; self.trace_shot=-1; self.trace_total=0
         self.trace_offset=0; self.trace_retries=0
         self._request_trace(0); self._buttons()
 
     def _request_trace(self,offset):
         self.trace_offset=offset; self.trace_deadline=time.monotonic()+4
-        self.worker.send(f'TRACE {offset}')
+        self.trace_request_serial=(self.trace_request_serial+1) & 0xffffffff
+        self.worker.send(self.trace_receiver.request(offset,self.trace_request_serial))
 
     def _next_trace_chunk(self):
         missing=next((i for i in range(self.trace_total) if i not in self.trace_points),None)
@@ -513,6 +554,7 @@ class MainWindow(QMainWindow):
             self._error('轨迹时间不连续，未计算精度'); return
         contact=self.shot_event.get('reason')=='SPEED_DROP' and int(self.shot_event.get('shot','-1'))==self.trace_shot
         self.metrics=analyze_trace(points,self.trace_target,contact=contact,window_us=self.trace_window)
+        self.trace_complete=True
         self._plot_trace(points)
         m=self.metrics
         reason=self.shot_event.get('reason','未知（只读出缓存轨迹）')
@@ -541,7 +583,7 @@ class MainWindow(QMainWindow):
         self.curve_raw.setData(x,raw); self.curve_angle.setData(x,angle); self.curve_pwm.setData(x,pwm)
 
     def export_trace(self):
-        if not self.trace_points or self.trace_busy or len(self.trace_points)!=self.trace_total: return
+        if not self.trace_complete or self.trace_busy: return
         name,_=QFileDialog.getSaveFileName(self,'保存轨迹',f'hammer_{dt.datetime.now():%Y%m%d_%H%M%S}.csv','CSV (*.csv)')
         if not name: return
         try:
@@ -582,7 +624,18 @@ class MainWindow(QMainWindow):
             self.worker.send('STATUS')
         self._buttons()
 
+    def _write_session_log(self,text):
+        if self.session_log is not None:
+            try:
+                self.session_log.write(f'[{dt.datetime.now():%H:%M:%S.%f}] {text}\n')
+                self.session_log.flush()
+            except OSError:
+                failed_log=self.session_log; self.session_log=None
+                try:failed_log.close()
+                except OSError:pass
+
     def _append(self,text):
+        self._write_session_log('UI '+text)
         self.log.appendPlainText(f'[{dt.datetime.now():%H:%M:%S}] {text}')
 
     def _error(self,text):
@@ -597,7 +650,12 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def closeEvent(self,event):
-        self.timer.stop(); self.port_timer.stop(); self.worker.close(); event.accept()
+        self.timer.stop(); self.port_timer.stop(); self.worker.close()
+        if self.session_log is not None:
+            try:self.session_log.close()
+            except OSError:pass
+            self.session_log=None
+        event.accept()
 
 
 def main():

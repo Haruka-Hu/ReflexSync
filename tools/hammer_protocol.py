@@ -1,7 +1,8 @@
-"""Pure protocol/analysis helpers shared by GUI, CLI and offline tests."""
+"""Protocol, reliable trace download and analysis helpers for the motor GUI."""
 from __future__ import annotations
 
 import math
+import zlib
 from dataclasses import dataclass, asdict
 
 
@@ -47,11 +48,95 @@ class TracePoint:
     @classmethod
     def parse(cls, line: str) -> 'TracePoint':
         p = fields(line)
-        return cls(int(p['i']), int(p['us']), *(float(p[k]) for k in
-                   ('angle', 'speed', 'raw', 'pwm', 'drop', 'baseline')))
+        point = cls(int(p['i']), int(p['us']), *(float(p[k]) for k in
+                    ('angle', 'speed', 'raw', 'pwm', 'drop', 'baseline')))
+        if point.index < 0 or not 0 <= point.time_us <= 0xffffffff or not all(
+                math.isfinite(getattr(point, k)) for k in
+                ('angle', 'speed', 'raw', 'pwm', 'drop', 'baseline')):
+            raise ValueError('轨迹含无效索引、时间或非有限数值')
+        return point
 
     def to_dict(self):
         return asdict(self)
+
+
+class TraceReplacedError(ValueError):
+    pass
+
+
+def checked_trace_fields(line: str, *, require_crc: bool) -> dict[str, str]:
+    payload, separator, checksum = line.rpartition(' crc=')
+    if separator:
+        if len(checksum) != 8 or zlib.crc32(payload.encode('ascii')) != int(checksum, 16):
+            raise ValueError('轨迹 CRC 校验失败')
+    elif require_crc:
+        raise ValueError('轨迹缺少 CRC')
+    words = line.split()
+    result = fields(line)
+    if len(result) != len(words)-1:
+        raise ValueError('轨迹字段缺失、重复或粘连')
+    return result
+
+
+class TraceReceiver:
+    """One trace download, with validated chunks and optional V8 request tokens.
+
+    Invalid rows raise without deleting already verified rows. The caller retries
+    at TRACE_END or its deadline. Rows outside a validated BEGIN/END are ignored.
+    """
+    def __init__(self, *, require_crc=False, request_ids=False, shot=-1):
+        self.require_crc, self.request_ids = require_crc, request_ids
+        self.shot = shot
+        self.total = None
+        self.points: dict[int, TracePoint] = {}
+        self.metadata: dict[str, str] = {}
+        self.offset = self.request_id = 0
+        self.chunk_open = False
+
+    def request(self, offset: int, request_id: int) -> str:
+        self.offset, self.request_id = offset, request_id
+        self.chunk_open = False
+        return f'TRACE {offset} {request_id}' if self.request_ids else f'TRACE {offset}'
+
+    def feed(self, line: str) -> bool:
+        p = checked_trace_fields(line, require_crc=self.require_crc)
+        if self.request_ids and int(p['request']) != self.request_id:
+            return False  # Delayed response from a canceled/previous request.
+        shot = int(p['shot'])
+        if not 0 <= shot <= 0xffffffff:
+            raise ValueError('轨迹编号无效')
+        if line.startswith('TRACE_BEGIN '):
+            if int(p['offset']) != self.offset:
+                return False
+            if self.shot >= 0 and self.shot != shot:
+                raise TraceReplacedError('轨迹已被下一次叩击覆盖')
+            total, target, window = int(p['total']), float(p['target']), int(p['window_us'])
+            if not 0 <= self.offset <= total <= 2048 or not math.isfinite(target) or target < 0 or (total>0 and target==0) or not 0 < window <= 1000000:
+                raise ValueError('轨迹头范围无效')
+            if self.total is not None and total != self.total:
+                raise ValueError('轨迹总数不一致')
+            for key in ('retract_angle', 'kp', 'ki', 'ks', 'kv', 'kg'):
+                if key in p and not math.isfinite(float(p[key])):
+                    raise ValueError('轨迹参数无效')
+            # Commit only after the complete header has passed validation.
+            self.shot, self.total, self.metadata = shot, total, p
+            self.chunk_open = True
+        elif self.chunk_open and shot == self.shot:
+            end = min(self.total, self.offset+8)
+            if line.startswith('TRACE '):
+                point = TracePoint.parse(line)
+                if not self.offset <= point.index < end:
+                    raise ValueError('轨迹索引不属于当前分块')
+                if point.index in self.points and self.points[point.index] != point:
+                    raise ValueError('重复轨迹点内容不一致')
+                self.points[point.index] = point
+            elif line.startswith('TRACE_END '):
+                if int(p['total']) != self.total or int(p['next']) != end or (
+                        'offset' in p and int(p['offset']) != self.offset):
+                    raise ValueError('轨迹分块尾不匹配')
+                self.chunk_open = False
+                return True
+        return False
 
 
 def analyze_trace(points: list[TracePoint], target: float, *, contact: bool,

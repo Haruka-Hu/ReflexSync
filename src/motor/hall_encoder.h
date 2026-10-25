@@ -2,11 +2,11 @@
 #include <Arduino.h>
 
 /**
- * @brief 霍尔磁正交编码器驱动类 (支持 4 倍频解码与差分测速)
+ * @brief 霍尔正交编码器：PCNT 硬件四倍频位置，GPIO 边沿周期辅助测速
  *
  * 原理说明：
  * - 电机转子每转一圈输出 16 个脉冲周期 (16 PPR)
- * - 单片机对 A 相与 B 相的双边沿（上升沿+下降沿）全部捕获，实现 4 倍频解码
+ * - PCNT 对 A/B 双边沿计数；GPIO ISR 仅提供边沿周期和计数对照诊断
  * - 配合 1:27 减速比，叩诊锤出轴旋转 1 圈的总脉冲数为：
  *   16 * 4 * 27 = 1728 个脉冲
  * - 角度分辨率为：360° / 1728 ≈ 0.208° (即每度 4.8 个脉冲)
@@ -33,7 +33,10 @@ class HallEncoder {
          * @brief 初始化编码器 GPIO 引脚与中断
          * 必须在 setup() 中调用一次，调用完成后编码器开始计数
          */
-        void begin();
+        bool begin();
+        bool ready() const { return ready_; }
+        int32_t isrCount() const;
+        uint32_t invalidTransitions() const;
 
         /**
          * @brief 获取累积的四倍频脉冲总计数值
@@ -58,7 +61,7 @@ class HallEncoder {
 
         /**
          * @brief 周期性测速刷新接口
-         * 必须由上层控制循环以固定周期（如 5ms）调用，用于微分计算瞬时速度
+         * 必须由上层以 1ms 周期调用，累计硬件计数并刷新速度、位置快照
          * @param dtSec 距离上一次调用的时间间隔（单位：秒）
          */
         void updateSpeed(float dtSec);
@@ -79,7 +82,7 @@ class HallEncoder {
         static void IRAM_ATTR isrHandler();
 
         float currentCountSpeedDeg_{0.0f};
-        portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
+        mutable portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
         volatile uint32_t edgeTimes_[4]{};
         volatile uint32_t lastEdgeUs_ = 0;
         volatile uint32_t fourEdgeUs_ = 0;
@@ -87,6 +90,12 @@ class HallEncoder {
         volatile uint8_t sameDirectionEdges_ = 0;
         volatile int8_t edgeDirection_ = 0;
         Config config_;
+        bool ready_ = false;
+        int16_t lastHardwareCount_ = 0;
+        int32_t lastIsrSpeedCount_ = 0;
+        volatile int32_t isrCount_ = 0;
+        volatile uint32_t invalidTransitions_ = 0;
+        uint8_t IRAM_ATTR readState() const;
         static HallEncoder *instance_;            // 静态单例指针，供中断 ISR 路由访问
 
         volatile int32_t pulseCount_{0};          // 易失变量：累计脉冲计数值 （volatile表示该变量可能在程序的任何地方被改变，所以每次访问时都从内存中重新读取）

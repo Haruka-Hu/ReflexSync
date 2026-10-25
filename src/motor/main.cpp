@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include "motion_controller.h"
 #include "host_output.h"
+#include "trace_integrity.h"
 
 #ifdef ARDUINO_ARCH_ESP32
 #include <atomic>
@@ -22,26 +23,43 @@ Drv8871Motor motor({MotorIn1, MotorIn2, 0, 1, 20000, 10});
 HallEncoder encoder({EncoderA, EncoderB, 16, 27});
 MotionController motion(motor, encoder);
 
-constexpr unsigned LineCapacity = 160, OutputCapacity = 320;
+constexpr unsigned LineCapacity = 160, OutputCapacity = 384;
 enum class Link : uint8_t { Usb=1, Ble=2, Both=3 };
 struct Command { char line[LineCapacity]; Link link=Link::Usb; };
 struct Output { char line[OutputCapacity]; };
 #ifdef ARDUINO_ARCH_ESP32
 static QueueHandle_t commands = nullptr, usbOutputs = nullptr, bleOutputs = nullptr;
 static Link replyLink = Link::Both;
-static std::atomic<uint32_t> usbDropped{0}, bleDropped{0};
+static std::atomic<uint32_t> usbDropped{0}, bleDropped{0}, bleRetries{0}, outputTruncated{0};
 static TaskHandle_t controllerTask = nullptr;
-static std::atomic<bool> stopRequested{false}, bleConnected{false}, restartAdvertising{false};
+static std::atomic<uint8_t> stopRequested{0}; // 1=user STOP, 2=BLE disconnect
+static std::atomic<bool> bleConnected{false}, restartAdvertising{false};
 static BLECharacteristic* bleTx = nullptr;
+static bool notifyAccepted = false; // SDK onStatus is synchronous inside notify().
+static std::atomic<uint16_t> bleMtu{23};
 static esp_timer_handle_t controlTimer;
 #else
-static bool stopRequested = false;
+static uint8_t stopRequested = 0;
 #endif
 
 void hostPrintf(const char* format, ...) {
     Output out{};
     va_list args; va_start(args, format);
-    vsnprintf(out.line, sizeof(out.line), format, args); va_end(args);
+    const int length=vsnprintf(out.line, sizeof(out.line), format, args); va_end(args);
+    const bool trace=!strncmp(out.line,"TRACE ",6) || !strncmp(out.line,"TRACE_BEGIN ",12)
+        || !strncmp(out.line,"TRACE_END ",10);
+    if (length<0 || size_t(length)+(trace?15U:0U)>=sizeof(out.line)) {
+#ifdef ARDUINO_ARCH_ESP32
+        ++outputTruncated;
+#endif
+        return; // Never emit a truncated line without its delimiter/checksum.
+    }
+    if (trace) {
+        size_t payload=size_t(length);
+        while (payload && (out.line[payload-1]=='\n' || out.line[payload-1]=='\r')) --payload;
+        const uint32_t crc=traceCrc32(out.line,payload);
+        snprintf(out.line+payload,sizeof(out.line)-payload," crc=%08lx\n",static_cast<unsigned long>(crc));
+    }
 #ifdef ARDUINO_ARCH_ESP32
     // Replies go to the requesting link; asynchronous motion events reach both.
     const bool event = !strncmp(out.line,"EVT ",4) || !strncmp(out.line,"HELLO ",6);
@@ -60,6 +78,17 @@ static bool nextFloat(const char*& p, float& x) {
     p = end; return true;
 }
 static bool atEnd(const char* p) { while (*p == ' ') ++p; return !*p; }
+static bool nextUnsigned(const char*& p, unsigned long& value) {
+    while (*p==' ') ++p;
+    if (*p<'0' || *p>'9') return false;
+    value=0;
+    while (*p>='0' && *p<='9') {
+        const unsigned digit=unsigned(*p-'0');
+        if (value>(0xffffffffUL-digit)/10) return false;
+        value=value*10+digit; ++p;
+    }
+    return !*p || *p==' ';
+}
 static void sendTuning(const char* prefix) {
     const auto& p = motion.tuning();
     hostPrintf("%s kp=%.4f ki=%.4f ks=%.4f kv=%.4f kg=%.4f\n", prefix, p.kp,p.ki,p.ks,p.kv,p.kg);
@@ -74,7 +103,7 @@ static void execute(const char* c, Link link=Link::Usb) {
     if (!strcmp(c,"STOP")) { motion.stop(); hostPrintf("OK STOP\n"); }
     else if (!strcmp(c,"PING")) hostPrintf("OK PING\n");
     else if (!strcmp(c,"INFO")) {
-        hostPrintf("INFO firmware=HAMMER_COAST_V7 protocol=2 period_us=1000 features=USB,BLE,HOME,JOG,TRACE,TUNE\n");
+        hostPrintf("INFO firmware=HAMMER_COAST_V12 protocol=2 period_us=1000 features=USB,BLE,HOME,JOG,TRACE,TUNE,TRACE_CRC,TRACE_REQUEST_ID,PCNT,BOUNDED_STRIKE,BOUNDED_HOME\n");
     }
     else if (!strncmp(c,"JOG ",4)) {
         const char* p=c+4; float speed;
@@ -96,6 +125,13 @@ static void execute(const char* c, Link link=Link::Usb) {
             MotionController::stateName(motion.state()), unsigned(motion.zeroed()), motion.angle(),
             motion.speed(), motion.rawSpeed(), motion.pwm(), motion.shotId(), motion.traceCount(),unsigned(motion.homing()),motor.outputMode(),motor.in1Duty(),motor.in2Duty(),motion.lastReason(),motion.positionError(),
             static_cast<unsigned long>(motion.settledMs()),static_cast<unsigned long>(motion.phaseMs()),unsigned(motion.autoFire()));
+#ifdef ARDUINO_ARCH_ESP32
+        hostPrintf("DIAG encoder=PCNT count=%ld isr_count=%ld invalid_ab=%lu ble_mtu=%u ble_retry=%lu ble_qdrop=%lu usb_qdrop=%lu truncated=%lu\n",
+            static_cast<long>(encoder.getCount()),static_cast<long>(encoder.isrCount()),
+            static_cast<unsigned long>(encoder.invalidTransitions()),unsigned(bleMtu.load()),
+            static_cast<unsigned long>(bleRetries.load()),static_cast<unsigned long>(bleDropped.load()),
+            static_cast<unsigned long>(usbDropped.load()),static_cast<unsigned long>(outputTruncated.load()));
+#endif
     } else if (!strcmp(c,"PARAMS")) {
         hostPrintf("PARAMS retract_angle=%.2f strike_speed=%.2f\n", motion.settings().retractAngleDeg, motion.settings().strikeSpeedDps);
     } else if (!strcmp(c,"TUNING")) sendTuning("TUNING");
@@ -119,30 +155,33 @@ static void execute(const char* c, Link link=Link::Usb) {
         if (motion.state() != MotionController::State::Idle) { hostPrintf("ERR TRACE busy\n"); return; }
         const char* p=c+5;
         while (*p==' ') ++p;
-        char* end=nullptr;
-        const unsigned long offset = *p ? strtoul(p,&end,10) : 0;
-        if ((*p && (*p=='-' || end==p || !atEnd(end))) || offset > motion.traceCount()) {
+        unsigned long offset=0, request=0;
+        if ((*p && !nextUnsigned(p,offset)) || offset>motion.traceCount()) {
             hostPrintf("ERR TRACE invalid_offset\n"); return;
+        }
+        while (*p==' ') ++p;
+        if ((*p && !nextUnsigned(p,request)) || !atEnd(p)) {
+            hostPrintf("ERR TRACE invalid_request\n"); return;
         }
         const unsigned total=motion.traceCount();
         const auto& ts=motion.traceSettings();
         const auto& tp=motion.traceTuning();
-        hostPrintf("TRACE_BEGIN shot=%u total=%u offset=%lu target=%.2f window_us=%lu "
+        hostPrintf("TRACE_BEGIN shot=%u total=%u offset=%lu request=%lu target=%.2f window_us=%lu "
             "reason=%s contact_candidate=%u retract_angle=%.2f kp=%.4f ki=%.4f ks=%.4f kv=%.4f kg=%.4f\n",
-            motion.shotId(),total,offset,motion.traceTarget(),static_cast<unsigned long>(DropWindowUs),
+            motion.shotId(),total,offset,request,motion.traceTarget(),static_cast<unsigned long>(DropWindowUs),
             motion.traceReason(),unsigned(motion.traceContact()),ts.retractAngleDeg,tp.kp,tp.ki,tp.ks,tp.kv,tp.kg);
         const unsigned limit = min(total, unsigned(offset)+TraceChunk);
         for (unsigned i=unsigned(offset);i<limit;++i) {
             const auto& s=motion.trace(i);
-            hostPrintf("TRACE shot=%u i=%u us=%lu angle=%.3f speed=%.3f raw=%.3f pwm=%.0f drop=%.3f baseline=%.3f\n",
-                motion.shotId(),i,static_cast<unsigned long>(s.timeUs),s.angle,s.speed,s.rawSpeed,s.pwm,s.dropSpeed,s.baseline);
+            hostPrintf("TRACE shot=%u request=%lu i=%u us=%lu angle=%.3f speed=%.3f raw=%.3f pwm=%.0f drop=%.3f baseline=%.3f\n",
+                motion.shotId(),request,i,static_cast<unsigned long>(s.timeUs),s.angle,s.speed,s.rawSpeed,s.pwm,s.dropSpeed,s.baseline);
         }
-        hostPrintf("TRACE_END shot=%u next=%u total=%u\n",motion.shotId(),limit,total);
+        hostPrintf("TRACE_END shot=%u next=%u total=%u offset=%lu request=%lu\n",motion.shotId(),limit,total,offset,request);
     } else hostPrintf("ERR UNKNOWN_COMMAND\n");
 }
 
 static void submit(const char* line, Link link) {
-    if (!strcmp(line,"STOP")) { stopRequested = true; return; }
+    if (!strcmp(line,"STOP")) { stopRequested = 1; return; }
 #ifdef ARDUINO_ARCH_ESP32
     Command cmd{}; cmd.link=link; strncpy(cmd.line,line,sizeof(cmd.line)-1);
     if (xQueueSend(commands,&cmd,0)!=pdTRUE) hostPrintf("ERR COMMAND_QUEUE_FULL\n");
@@ -156,7 +195,7 @@ struct LineParser {
     char line[LineCapacity]{};
     unsigned length=0; bool discard=false;
     void feed(char ch) {
-        if (ch=='!') { stopRequested=true; length=0; discard=true; }
+        if (ch=='!') { stopRequested=1; length=0; discard=true; }
         else if (ch=='\n' || ch=='\r') {
             if (!discard && length) { line[length]=0; submit(line,link); }
             discard=false; length=0;
@@ -172,16 +211,25 @@ static LineParser bleParser(Link::Ble);
 #endif
 #ifdef ARDUINO_ARCH_ESP32
 class BleServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer*) override { bleParser=LineParser{Link::Ble}; bleConnected=true; }
+    void onConnect(BLEServer*) override { bleParser=LineParser{Link::Ble}; bleMtu=23; bleConnected=true; }
+    void onMtuChanged(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
+        bleMtu=param->mtu.mtu>=23 ? param->mtu.mtu : 23;
+    }
     void onDisconnect(BLEServer*) override {
         bleConnected=false; restartAdvertising=true;
-        stopRequested=true; // same STOP path; no extra state
+        stopRequested=2; // same STOP path; report the actual trigger
     }
 };
 class BleRxCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* characteristic) override {
         const std::string value=characteristic->getValue();
         for (char ch : value) bleParser.feed(ch);
+    }
+};
+class BleTxCallbacks : public BLECharacteristicCallbacks {
+    void onStatus(BLECharacteristic*, Status status, uint32_t) override {
+        // SUCCESS_NOTIFY means queued by the stack, not delivered to the host.
+        notifyAccepted=status==SUCCESS_NOTIFY;
     }
 };
 static void initBle() {
@@ -191,6 +239,7 @@ static void initBle() {
     auto* service=server->createService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
     bleTx=service->createCharacteristic("6E400003-B5A3-F393-E0A9-E50E24DCCA9E", BLECharacteristic::PROPERTY_NOTIFY);
     bleTx->addDescriptor(new BLE2902);
+    bleTx->setCallbacks(new BleTxCallbacks);
     auto* rx=service->createCharacteristic("6E400002-B5A3-F393-E0A9-E50E24DCCA9E",
         BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
     rx->setCallbacks(new BleRxCallbacks);
@@ -202,8 +251,10 @@ static void timerTick(void*) { if (controllerTask) xTaskNotifyGive(controllerTas
 static void controlLoop(void*) {
     while (true) {
         ulTaskNotifyTake(pdTRUE,portMAX_DELAY);
-        if (stopRequested.exchange(false)) {
-            xQueueReset(commands); replyLink=Link::Both; motion.stop(); hostPrintf("OK STOP\n");
+        const uint8_t stop=stopRequested.exchange(0);
+        if (stop) {
+            xQueueReset(commands); replyLink=Link::Both;
+            motion.stop(stop==2 ? "BLE_DISCONNECT" : "USER_STOP"); hostPrintf("OK STOP\n");
         } else {
             Command command{};
             if (xQueueReceive(commands,&command,0)==pdTRUE) execute(command.line,command.link);
@@ -232,10 +283,16 @@ static void flushOutput() {
     if (!bleLength && xQueueReceive(bleOutputs,&blePending,0)==pdTRUE) {
         bleLength=strlen(blePending.line); bleOffset=0;
     }
-    if (bleLength && uint32_t(micros()-lastNotifyUs)>=2000) {
-        const size_t count=min(size_t(20),bleLength-bleOffset);
+    if (bleLength && uint32_t(micros()-lastNotifyUs)>=10000) {
+        // Use the negotiated MTU, not the local requested MTU. Default ATT=23.
+        const size_t payload=min(size_t(182),size_t(bleMtu.load()-3));
+        const size_t count=min(payload,bleLength-bleOffset);
         bleTx->setValue(reinterpret_cast<uint8_t*>(blePending.line)+bleOffset,count);
-        bleTx->notify(); lastNotifyUs=micros(); bleOffset+=count;
+        notifyAccepted=false;
+        bleTx->notify(); lastNotifyUs=micros();
+        // Retry this exact fragment on congestion; never skip rejected bytes.
+        if (notifyAccepted) bleOffset+=count;
+        else ++bleRetries;
         if (bleOffset==bleLength) bleLength=0;
     }
 }
@@ -260,7 +317,7 @@ void setup() {
         motor.stop(); Serial.println("ERR INIT timer"); return;
     }
 #endif
-    hostPrintf("HELLO HAMMER_COAST_V7 protocol=2 period_us=1000\n");
+    hostPrintf("HELLO HAMMER_COAST_V12 protocol=2 period_us=1000\n");
     hostPrintf("INFO Commands: INFO, JOG signed_speed, HOME, ZERO, SET 60 200, START, RETRACT, FIRE, STOP, STATUS, PARAMS, TUNING, TUNE, TRACE\n");
 }
 void loop() {

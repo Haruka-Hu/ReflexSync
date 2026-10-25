@@ -6,7 +6,9 @@ using namespace HammerConfig;
 MotionController::MotionController(Drv8871Motor& m, HallEncoder& e)
     : motor_(m), encoder_(e), dropDetector_(SpeedDropDetector::Config{}) {}
 void MotionController::begin() {
-    motor_.begin(); encoder_.begin(); motor_.stop(); lastUpdateUs_ = micros();
+    motor_.begin(); motor_.stop();
+    if (!encoder_.begin()) hostPrintf("ERR INIT encoder_pcnt\n");
+    lastUpdateUs_ = micros();
 }
 const char* MotionController::stateName(State s) {
     switch (s) {
@@ -18,13 +20,15 @@ const char* MotionController::stateName(State s) {
     return "UNKNOWN";
 }
 bool MotionController::zeroHere() {
-    if (state_ != State::Idle || fabsf(speed()) > StillSpeed) return false;
-    encoder_.reset(); zeroed_ = true; autoFire_ = false; homing_ = false; lastReason_="ZEROED";
+    if (!encoder_.ready() || state_ != State::Idle || fabsf(speed()) > StillSpeed) return false;
+    encoder_.reset();
+    if (!encoder_.ready()) return false;
+    zeroed_ = true; autoFire_ = false; homing_ = false; lastReason_="ZEROED";
     speedController_.reset(); holdIntegral_ = 0; dropDetector_.reset();
     return true;
 }
 bool MotionController::home() {
-    if (state_ != State::Idle || fabsf(speed()) > StillSpeed) return false;
+    if (!encoder_.ready() || state_ != State::Idle || fabsf(speed()) > StillSpeed) return false;
     autoFire_ = false; homing_ = true; zeroed_ = false; lastReason_="HOMING";
     phaseStartMs_ = millis(); homeStillSinceMs_ = phaseStartMs_;
     homeLastCount_ = encoder_.getCount(); homeStartAngle_ = angle();
@@ -37,7 +41,7 @@ bool MotionController::home() {
 bool MotionController::jog(float signedSpeed) {
     if (!isfinite(signedSpeed) || fabsf(signedSpeed)<1 || fabsf(signedSpeed)>80) return false;
     if (!jogging_) {
-        if (state_!=State::Idle || fabsf(speed())>StillSpeed) return false;
+        if (!encoder_.ready() || state_!=State::Idle || fabsf(speed())>StillSpeed) return false;
         homing_=false; autoFire_=false; zeroed_=false; homeIntegral_=0;
         phaseStartMs_=millis(); state_=State::Retract; jogging_=true; lastReason_="JOGGING";
     }
@@ -99,10 +103,15 @@ float MotionController::holdControl(float pos, float vel, float dt) {
     const float friction = effort * constrain(err / PositionFrictionWidthDeg, -1.0f, 1.0f);
     const float base = PositionKp * err - PositionKd * vel + friction;
     const float raw = base + holdIntegral_;
+    const bool stationary = fabsf(vel) < 5;
     const bool nearAndSlow = fabsf(err) <= PositionIntegralZoneDeg && fabsf(vel) <= PositionIntegralSpeed;
+    // At rest the integral must also work outside the near-target zone. Otherwise
+    // a larger load can leave a permanent P-only stall halfway through retract.
+    // Clamp the static integration error; retain the same effort limit/protection.
+    const float integralError = stationary ? constrain(err,-PositionIntegralZoneDeg,PositionIntegralZoneDeg) : err;
     const bool unwinding = holdIntegral_ * err < 0;
-    if ((nearAndSlow || unwinding) && (fabsf(raw) <= MaxPwm || raw * err < 0)) {
-        holdIntegral_ = constrain(holdIntegral_ + (fabsf(vel) < 5 ? PositionStaticKi : PositionKi) * err * dt,
+    if ((nearAndSlow || stationary || unwinding) && (fabsf(raw) <= MaxPwm || raw * err < 0)) {
+        holdIntegral_ = constrain(holdIntegral_ + (stationary ? PositionStaticKi : PositionKi) * integralError * dt,
                                   -PositionIntegralLimit, PositionIntegralLimit);
     }
     return constrain(base + holdIntegral_, -MaxPwm, MaxPwm);
@@ -123,14 +132,20 @@ void MotionController::endStrike(const char* reason, bool candidate) {
                traceCount_, unsigned(zeroed_));
 }
 void MotionController::abortMotion(const char* reason) {
+    const State previousState=state_;
+    const uint32_t phase=phaseMs();
+    const uint32_t stalled=state_==State::Retract && !homing_ && !jogging_ ? millis()-lastProgressMs_ : 0;
     const bool wasStrike = state_ == State::Strike; lastReason_=reason;
     motor_.brake(); appliedPwm_ = 0; state_ = State::Idle;
     zeroed_ = false; autoFire_ = false; homing_ = false; jogging_ = false;
     if (wasStrike) { traceReason_ = reason; traceContact_ = false; recordTrace(micros()); }
-    hostPrintf("EVT ABORT reason=%s angle=%.2f speed=%.2f shot=%u samples=%u\n",
-               reason, angle(), speed(), shotId_, traceCount_);
+    hostPrintf("EVT ABORT reason=%s angle=%.2f speed=%.2f shot=%u samples=%u "
+               "state_before=%s target=%.2f pos_error=%.2f phase_ms=%lu stalled_ms=%lu gap_us=%lu encoder_ok=%u\n",
+               reason, angle(), speed(), shotId_, traceCount_,stateName(previousState),targetAngle_,positionError(),
+               static_cast<unsigned long>(phase),static_cast<unsigned long>(stalled),
+               static_cast<unsigned long>(lastControlGapUs_),unsigned(encoder_.ready()));
 }
-void MotionController::stop() { abortMotion("USER_STOP"); }
+void MotionController::stop(const char* reason) { abortMotion(reason); }
 void MotionController::update() {
     const uint32_t nowUs = micros(), elapsed = nowUs - lastUpdateUs_;
     #ifdef ARDUINO_ARCH_ESP32
@@ -140,13 +155,13 @@ void MotionController::update() {
 #else
     if (elapsed < ControlPeriodUs) return;
 #endif
-    lastUpdateUs_ = nowUs;
+    lastUpdateUs_ = nowUs; lastControlGapUs_=elapsed;
     const float dt = elapsed * 1e-6f;
     encoder_.updateSpeed(dt);
     const uint32_t nowMs = millis();
     const float pos = angle(), measured = speed();
     if (state_ == State::Idle) return;
-    if (elapsed > MaxControlGapUs || !isfinite(pos) || !isfinite(measured)) {
+    if (!encoder_.ready() || elapsed > MaxControlGapUs || !isfinite(pos) || !isfinite(measured)) {
         abortMotion("CONTROL_OR_SENSOR"); return;
     }
     if (jogging_) {
@@ -164,6 +179,7 @@ void MotionController::update() {
         return;
     }
     if (homing_) {
+        if (fabsf(pos-homeStartAngle_) >= HomeTravelLimitDeg) { abortMotion("HOME_TRAVEL_LIMIT"); return; }
         if (nowMs - phaseStartMs_ >= HomeTimeoutMs) { abortMotion("HOME_TIMEOUT"); return; }
         const int32_t count = encoder_.getCount();
         if (count != homeLastCount_) {
@@ -176,7 +192,9 @@ void MotionController::update() {
             && fabsf(measured) < 5 && appliedPwm_ >= HomeContactPwm) {
             motor_.stop(); appliedPwm_ = 0; state_ = State::Idle; homing_ = false;
             const float travel = pos-homeStartAngle_;
-            encoder_.reset(); zeroed_ = true; speedController_.reset(); holdIntegral_ = 0; lastReason_="HOME_DONE";
+            encoder_.reset();
+            if (!encoder_.ready()) { abortMotion("CONTROL_OR_SENSOR"); return; }
+            zeroed_ = true; speedController_.reset(); holdIntegral_ = 0; lastReason_="HOME_DONE";
             hostPrintf("EVT HOME contact_candidate=1 angle_before=%.2f travel=%.2f peak_speed=%.2f zeroed=1\n",
                        pos, travel, homePeakSpeed_);
             return;
@@ -222,7 +240,10 @@ void MotionController::update() {
         return;
     }
     if (state_ == State::Strike) {
-        if (nowMs - phaseStartMs_ >= StrikeTimeoutMs) { endStrike("TIMEOUT_NO_DROP", false); return; }
+        if (pos >= StrikeForwardLimitDeg || pos < -settings_.retractAngleDeg-StrikeReverseMarginDeg) {
+            abortMotion("STRIKE_TRAVEL_LIMIT"); return;
+        }
+        if (nowMs - phaseStartMs_ >= StrikeTimeoutMs) { abortMotion("TIMEOUT_NO_DROP"); return; }
         // Cap the recent peak to 115% of target: correcting an overshoot down to
         // target is not a contact. Do not disable early-contact detection.
         const float ceiling = fmaxf(DropMinSpeed, settings_.strikeSpeedDps * 1.15f);

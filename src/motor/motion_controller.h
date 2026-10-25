@@ -28,7 +28,7 @@ public:
     bool retract();
     bool start();
     bool fire();
-    void stop();
+    void stop(const char* reason = "USER_STOP");
     State state() const { return state_; }
     bool zeroed() const { return zeroed_; }
     const char* lastReason() const { return lastReason_; }
@@ -64,6 +64,7 @@ private:
     uint32_t jogRefreshMs_ = 0;
     float jogTarget_ = 0;
     float targetAngle_ = 0, holdIntegral_ = 0, appliedPwm_ = 0;
+    uint32_t lastControlGapUs_ = 0;
     uint32_t lastUpdateUs_ = 0, phaseStartMs_ = 0, strikeStartUs_ = 0;
     uint32_t stableSinceMs_ = 0, lastProgressMs_ = 0;
     uint32_t lastReverseUs_ = 0;

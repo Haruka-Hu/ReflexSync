@@ -22,6 +22,8 @@ public:
         armed_ = latched_ = building_ = false;
         fastSince_ = 0;
         speed_ = baseline_ = 0;
+        windowLow_ = feedbackLow_ = false;
+        windowLowUs_ = feedbackLowUs_ = 0;
     }
     bool update(float angle, uint32_t now, bool allowArm = true,
                 bool allowTrigger = true, float baselineCeiling = INFINITY,
@@ -58,12 +60,20 @@ public:
                 building_ = false;
             }
         }
-        if (allowTrigger && valid && armed_ && measured <= triggerSpeedCeiling && baseline_ >= cfg_.minSpeed &&
-            baseline_ - measured >= cfg_.absoluteDrop &&
-            baseline_ - measured >= baseline_ * cfg_.relativeDrop &&
-            (!isfinite(feedbackSpeed) ||
-             (baseline_ - feedbackSpeed >= cfg_.absoluteDrop &&
-              baseline_ - feedbackSpeed >= baseline_ * cfg_.relativeDrop))) {
+        // The window and filtered feedback have different delays. Require both
+        // to corroborate a drop within 3ms, instead of on the very same tick.
+        if (valid && armed_ && baseline_ >= cfg_.minSpeed) {
+            if (baseline_-measured >= cfg_.absoluteDrop && baseline_-measured >= baseline_*cfg_.relativeDrop) {
+                windowLow_=true; windowLowUs_=now;
+            }
+            if (!isfinite(feedbackSpeed) || (baseline_-feedbackSpeed >= cfg_.absoluteDrop &&
+                baseline_-feedbackSpeed >= baseline_*cfg_.relativeDrop)) {
+                feedbackLow_=true; feedbackLowUs_=now;
+            }
+        }
+        if (allowTrigger && valid && armed_ && measured <= triggerSpeedCeiling &&
+            windowLow_ && feedbackLow_ && uint32_t(now-windowLowUs_) <= 3000U &&
+            uint32_t(now-feedbackLowUs_) <= 3000U) {
             latched_ = true;
         }
         samples_[head_] = {now, angle, measured, valid};
@@ -83,5 +93,7 @@ private:
     unsigned head_, size_;
     uint32_t fastSince_;
     bool armed_, latched_, building_;
+    bool windowLow_, feedbackLow_;
+    uint32_t windowLowUs_, feedbackLowUs_;
     float speed_, baseline_;
 };
