@@ -13,7 +13,7 @@ constexpr bool ENABLE_INTERNAL_TEST_SIGNAL = false;
 // RLD configuration. The source channels start at logical CH01 and are selected
 // in complete 8-channel ADS blocks.
 constexpr bool ENABLE_RLD = true;
-constexpr size_t RLD_SOURCE_CHANNEL_COUNT = 8;
+constexpr size_t RLD_SOURCE_CHANNEL_COUNT = 16;
 constexpr bool RLD_USE_P_INPUTS = true;
 constexpr bool RLD_USE_N_INPUTS = true;
 // Block 0 is CH01..CH08 / CS5, whose RLDOUT is connected to the RLD electrode.
